@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime"
 	"time"
 
 	"github.com/go-gfx/webgpu"
@@ -16,6 +17,9 @@ import (
 // model file and sent to the GPU in pieces of at most this many bytes, so the
 // whole model never sits in guest memory.
 const ChunkSize = 16 << 20
+
+// PieceSize is the size of one read from the model file while loading.
+const PieceSize = 4 << 20
 
 // Limits are the adapter limits the kernels adapt to (the capset's
 // DeviceLimits, go-virtio/gpu wgpubatch). Nothing in the kernels assumes a
@@ -93,6 +97,13 @@ type GPU struct {
 
 	rec   *webgpu.Recorder
 	Stats Stats
+
+	raw, qsb, db, mb []byte // load scratch, reused
+	named            map[string]*webgpu.Buffer
+	keep             []any // every GPU object, alive for the life of the model (remote objects are released when collected)
+	// Layers, when non-zero, runs only that many layers (debugging; no
+	// logits and no sampling are then produced).
+	Layers int
 }
 
 func (g *GPU) buffer(size uint64, usage webgpu.BufferUsage) (*webgpu.Buffer, error) {
@@ -108,6 +119,7 @@ func (g *GPU) buffer(size uint64, usage webgpu.BufferUsage) (*webgpu.Buffer, err
 		return nil, err
 	}
 	g.used += size
+	g.keep = append(g.keep, b) // a bind group holds only the id: the Buffer must outlive it
 	return b, nil
 }
 
@@ -142,6 +154,7 @@ func (g *GPU) newKernel(name, src, access string) error {
 		return err
 	}
 	g.k[name] = &kernel{p, bgl}
+	g.keep = append(g.keep, m, pl, p, bgl)
 	return nil
 }
 
@@ -188,6 +201,9 @@ func (u *uploader) flush() error {
 	}
 	u.g.Stats.Submits++
 	u.rec, u.pending = nil, 0
+	// The recorder and the sink's frame held two copies of the chunk; give
+	// them back now, so the guest's memory stays a few chunks, not the model.
+	runtime.GC()
 	return nil
 }
 
@@ -245,11 +261,13 @@ func (g *GPU) loadMat(u *uploader, f *gguf.File, r io.ReaderAt, name string) (*m
 			return nil, err
 		}
 	}
-	per := uint64(ChunkSize/1) / bb / 2 // blocks per piece: the raw read plus its repack stay near ChunkSize
-	raw := make([]byte, per*bb)
-	qsb := make([]byte, per*qb)
-	db := make([]byte, per*4)
-	mb := make([]byte, per*4)
+	// Pieces of PieceSize raw bytes, in scratch buffers allocated once: the
+	// guest's own memory stays a few times PieceSize however big the model.
+	per := uint64(PieceSize) / bb
+	if g.raw == nil {
+		g.raw, g.qsb, g.db, g.mb = make([]byte, PieceSize), make([]byte, PieceSize), make([]byte, PieceSize/4), make([]byte, PieceSize/4)
+	}
+	raw, qsb, db, mb := g.raw, g.qsb, g.db, g.mb
 	for b0 := uint64(0); b0 < nblk; b0 += per {
 		n := min(per, nblk-b0)
 		if _, err := r.ReadAt(raw[:n*bb], int64(f.DataOffset+t.Offset+b0*bb)); err != nil {
@@ -345,7 +363,7 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	if ctx <= 0 || ctx > cfg.Ctx {
 		ctx = cfg.Ctx
 	}
-	g := &GPU{dev: dev, lim: lim, Cfg: cfg, ctx: ctx, wg: lim.WorkgroupSize(), k: map[string]*kernel{}, kinds: map[*webgpu.BindGroup]string{}}
+	g := &GPU{dev: dev, lim: lim, Cfg: cfg, ctx: ctx, wg: lim.WorkgroupSize(), named: map[string]*webgpu.Buffer{}, k: map[string]*kernel{}, kinds: map[*webgpu.BindGroup]string{}}
 	if lim.MaxWorkgroupsPerDimension == 0 || lim.MaxStorageBuffers < 8 {
 		return nil, errors.New("llm: adapter limits below WebGPU's defaults")
 	}
@@ -371,6 +389,9 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	}
 	x, h, q, kk, vv, att, gt, up, logits, state, tokens, outb, scratch := bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7], bufs[8], bufs[9], bufs[10], bufs[11], bufs[12]
 	g.state, g.tokens, g.outb, g.logits = state, tokens, outb, logits
+	for n, b := range map[string]*webgpu.Buffer{"x": x, "h": h, "q": q, "k": kk, "v": vv, "att": att, "gate": gt, "up": up, "logits": logits, "state": state, "tokens": tokens, "outb": outb} {
+		g.named[n] = b
+	}
 	if g.outRead, err = g.buffer(4, webgpu.BufferUsageMapRead|webgpu.BufferUsageCopyDst); err != nil {
 		return nil, err
 	}
@@ -530,7 +551,12 @@ func (g *GPU) token(p *webgpu.ComputePassRecorder, head bool) {
 	mvx := func(rows int) (uint32, uint32) { return g.grid(rows) }
 	rx, ry := g.groups((c.Heads+c.KVHeads)*c.HeadDim/2 + kvd)
 	sx, sy := g.groups(c.FF)
-	for _, l := range g.layers {
+	layers := g.layers
+	if g.Layers != 0 && g.Layers < len(layers) {
+		layers = layers[:max(g.Layers, 0)]
+		head = false
+	}
+	for _, l := range layers {
 		g.dispatch(p, "rms", l.rms1, 1, 1)
 		x, y := mvx(c.Embd)
 		g.dispatch(p, g.mvk(l.q), l.q, x, y)
@@ -694,4 +720,33 @@ func (g *GPU) Generate(prompt []int32, n int, eos int32, emit func(int32) bool) 
 	tm.Decode = time.Since(t1)
 	tm.Submits, tm.Dispatches = g.Stats.Submits-s0, g.Stats.Dispatches-d0
 	return tm, nil
+}
+
+// Peek reads the first n floats of an activation buffer ("x", "h", "q", "k",
+// "v", "att", "gate", "up", "logits"): for tests, never in the decode loop.
+func (g *GPU) Peek(name string, n int) ([]float32, error) {
+	b, ok := g.named[name]
+	if !ok {
+		return nil, fmt.Errorf("llm: no buffer %q", name)
+	}
+	tmp, err := g.dev.CreateBuffer(webgpu.BufferDescriptor{Size: uint64(4 * n), Usage: webgpu.BufferUsageMapRead | webgpu.BufferUsageCopyDst})
+	if err != nil {
+		return nil, err
+	}
+	rec := g.dev.NewRecorder()
+	rec.CopyBufferToBuffer(b, 0, tmp, 0, uint64(4*n))
+	rb := rec.ReadBuffer(tmp, 0, uint64(4*n))
+	if _, err := rec.Submit(); err != nil {
+		return nil, err
+	}
+	g.Stats.Submits++
+	raw, err := rb.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]float32, n)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
+	}
+	return out, nil
 }

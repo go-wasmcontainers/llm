@@ -104,6 +104,8 @@ func main() {
 		report(tm)
 	case "check":
 		check(g, f, fh, tok, prompt, *n, *ctx)
+	case "trace":
+		trace(g, f, fh, tok, prompt, *ctx)
 	case "bench":
 		bench(g, tok, *rounds, *p, *n)
 	default:
@@ -181,4 +183,37 @@ func bench(g *llm.GPU, tok *llm.Tokenizer, rounds, p, n int) {
 	slices.Sort(dec)
 	fmt.Printf("bench p=%d n=%d rounds=%d: prefill median %.1f (min %.1f max %.1f) tok/s, decode median %.1f (min %.1f max %.1f) tok/s\n",
 		p, n, rounds, pre[len(pre)/2], pre[0], pre[len(pre)-1], dec[len(dec)/2], dec[0], dec[len(dec)-1])
+}
+
+// trace compares the residual stream of the GPU and the CPU path after
+// 0, 1, 2, 5, 15 and all layers, for the first token of the prompt: where
+// the two first disagree is where the defect is.
+func trace(g *llm.GPU, f *gguf.File, r io.ReaderAt, tok *llm.Tokenizer, prompt string, ctx int) {
+	ids := tok.Encode(prompt)[:1]
+	cpu, err := llm.LoadCPU(f, r, ctx)
+	if err != nil {
+		die(err)
+	}
+	for _, l := range []int{-1, 1, 2, 5, 15, 30} {
+		g.Layers, cpu.MaxLayers = l, l
+		cpu.Reset()
+		cpu.Forward(ids[0])
+		want := cpu.LastX
+		if _, err := g.PrefillLogits(ids); err != nil && l == 30 {
+			die(err)
+		}
+		got, err := g.Peek("x", len(want))
+		if err != nil {
+			die(err)
+		}
+		var maxAbs, maxRef float64
+		for i := range want {
+			maxAbs = math.Max(maxAbs, math.Abs(float64(got[i]-want[i])))
+			maxRef = math.Max(maxRef, math.Abs(float64(want[i])))
+		}
+		st, _ := g.Peek("state", 2)
+		tk, _ := g.Peek("tokens", 2)
+		fmt.Printf("state bits %x %x tokens bits %x %x\n", math.Float32bits(st[0]), math.Float32bits(st[1]), math.Float32bits(tk[0]), math.Float32bits(tk[1]))
+		fmt.Printf("layers %d: x max |gpu-cpu| = %.3e (max |x| %.3f); gpu %v cpu %v\n", l, maxAbs, maxRef, got[:4], want[:4])
+	}
 }

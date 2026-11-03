@@ -131,23 +131,49 @@ func (f *File) Tensor(name string) (*Tensor, bool) {
 }
 
 type reader struct {
-	r   io.ReaderAt
-	pos uint64
-	lim uint64
-	buf [8]byte
+	r      io.ReaderAt
+	win    []byte // read-ahead window
+	winOff uint64
+	pos    uint64
+	lim    uint64
+	buf    [8]byte
 }
+
+// readAhead is the size of the window the header is read through: a header
+// is thousands of tiny fields, and in a container each ReadAt is a system
+// call that crosses into the host.
+const readAhead = 1 << 20
 
 func (r *reader) read(p []byte) error {
 	if r.pos+uint64(len(p)) > r.lim {
 		return fmt.Errorf("%w: header runs past byte %d", ErrBound, r.lim)
 	}
-	n, err := r.r.ReadAt(p, int64(r.pos))
-	if n < len(p) {
-		if err == nil || err == io.EOF {
-			err = io.ErrUnexpectedEOF
+	if uint64(len(p)) >= readAhead {
+		n, err := r.r.ReadAt(p, int64(r.pos))
+		if n < len(p) {
+			if err == nil || err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return err
 		}
-		return err
+		r.pos += uint64(len(p))
+		return nil
 	}
+	if r.pos < r.winOff || r.pos+uint64(len(p)) > r.winOff+uint64(len(r.win)) {
+		if r.win == nil {
+			r.win = make([]byte, readAhead)
+		}
+		n, err := r.r.ReadAt(r.win[:min(uint64(readAhead), r.lim-r.pos)], int64(r.pos))
+		r.winOff, r.win = r.pos, r.win[:n]
+		if n < len(p) {
+			if err == nil || err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		r.win = r.win[:n:readAhead]
+	}
+	copy(p, r.win[r.pos-r.winOff:])
 	r.pos += uint64(len(p))
 	return nil
 }

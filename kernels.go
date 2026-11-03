@@ -55,16 +55,16 @@ struct Meta { n: u32 }
 @group(0) @binding(2) var<storage, read> dd: array<f32>;
 @group(0) @binding(3) var<storage, read_write> x: array<f32>;
 @group(0) @binding(4) var<storage, read> state: array<u32>;
-@group(0) @binding(5) var<storage, read> meta: Meta;
+@group(0) @binding(5) var<storage, read> prm: Meta;
 
 // Q8_0 row gather: element e of the token's row is d * int8.
 @compute @workgroup_size({{WG}})
 fn main(@builtin(local_invocation_index) li: u32) {
   let tok = tokens[state[1]];
-  let nb = meta.n / 32u;
+  let nb = prm.n / 32u;
   var e = li;
   loop {
-    if (e >= meta.n) { break; }
+    if (e >= prm.n) { break; }
     let b = e / 32u;
     let w = qs[(tok * nb + b) * 8u + (e % 32u) / 4u];
     let v = extractBits(bitcast<i32>(w), 8u * (e % 4u), 8u);
@@ -79,22 +79,22 @@ struct Meta { n: u32, eps: f32 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
-@group(0) @binding(3) var<storage, read> meta: Meta;
+@group(0) @binding(3) var<storage, read> prm: Meta;
 
 @compute @workgroup_size({{WG}})
 fn main(@builtin(local_invocation_index) li: u32) {
   var ss = 0.0;
   var i = li;
   loop {
-    if (i >= meta.n) { break; }
+    if (i >= prm.n) { break; }
     ss = ss + x[i] * x[i];
     i = i + {{WG}}u;
   }
   let tot = rsum(li, ss);
-  let s = 1.0 / sqrt(tot / f32(meta.n) + meta.eps);
+  let s = 1.0 / sqrt(tot / f32(prm.n) + prm.eps);
   i = li;
   loop {
-    if (i >= meta.n) { break; }
+    if (i >= prm.n) { break; }
     y[i] = x[i] * s * w[i];
     i = i + {{WG}}u;
   }
@@ -114,14 +114,14 @@ const kernelMatvecQ40 = matvecHead + `
 @group(0) @binding(1) var<storage, read> dd: array<f32>;
 @group(0) @binding(2) var<storage, read> x: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
-@group(0) @binding(4) var<storage, read> meta: Meta;
+@group(0) @binding(4) var<storage, read> prm: Meta;
 
 @compute @workgroup_size({{WG}})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-  let row = wid.y * meta.nx + wid.x;
-  let valid = row < meta.nout;
+  let row = wid.y * prm.nx + wid.x;
+  let valid = row < prm.nout;
   let r = select(0u, row, valid);
-  let nb = meta.nin / 32u;
+  let nb = prm.nin / 32u;
   let words = nb * 4u;
   var acc = 0.0;
   var w = li;
@@ -142,7 +142,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   }
   let tot = rsum(li, acc);
   if (li == 0u && valid) {
-    if (meta.acc == 1u) { y[row] = y[row] + tot; } else { y[row] = tot; }
+    if (prm.acc == 1u) { y[row] = y[row] + tot; } else { y[row] = tot; }
   }
 }
 `
@@ -153,14 +153,14 @@ const kernelMatvecQ41 = matvecHead + `
 @group(0) @binding(2) var<storage, read> mm: array<f32>;
 @group(0) @binding(3) var<storage, read> x: array<f32>;
 @group(0) @binding(4) var<storage, read_write> y: array<f32>;
-@group(0) @binding(5) var<storage, read> meta: Meta;
+@group(0) @binding(5) var<storage, read> prm: Meta;
 
 @compute @workgroup_size({{WG}})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-  let row = wid.y * meta.nx + wid.x;
-  let valid = row < meta.nout;
+  let row = wid.y * prm.nx + wid.x;
+  let valid = row < prm.nout;
   let r = select(0u, row, valid);
-  let nb = meta.nin / 32u;
+  let nb = prm.nin / 32u;
   let words = nb * 4u;
   var acc = 0.0;
   var w = li;
@@ -184,7 +184,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   }
   let tot = rsum(li, acc);
   if (li == 0u && valid) {
-    if (meta.acc == 1u) { y[row] = y[row] + tot; } else { y[row] = tot; }
+    if (prm.acc == 1u) { y[row] = y[row] + tot; } else { y[row] = tot; }
   }
 }
 `
@@ -194,14 +194,14 @@ const kernelMatvecQ80 = matvecHead + `
 @group(0) @binding(1) var<storage, read> dd: array<f32>;
 @group(0) @binding(2) var<storage, read> x: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
-@group(0) @binding(4) var<storage, read> meta: Meta;
+@group(0) @binding(4) var<storage, read> prm: Meta;
 
 @compute @workgroup_size({{WG}})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-  let row = wid.y * meta.nx + wid.x;
-  let valid = row < meta.nout;
+  let row = wid.y * prm.nx + wid.x;
+  let valid = row < prm.nout;
   let r = select(0u, row, valid);
-  let nb = meta.nin / 32u;
+  let nb = prm.nin / 32u;
   let words = nb * 8u;
   var acc = 0.0;
   var w = li;
@@ -220,7 +220,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   }
   let tot = rsum(li, acc);
   if (li == 0u && valid) {
-    if (meta.acc == 1u) { y[row] = y[row] + tot; } else { y[row] = tot; }
+    if (prm.acc == 1u) { y[row] = y[row] + tot; } else { y[row] = tot; }
   }
 }
 `
@@ -238,35 +238,35 @@ struct Meta { heads: u32, kvheads: u32, hd: u32, ctx: u32 }
 @group(0) @binding(4) var<storage, read_write> vc: array<f32>;
 @group(0) @binding(5) var<storage, read> state: array<u32>;
 @group(0) @binding(6) var<storage, read> cs: array<f32>;
-@group(0) @binding(7) var<storage, read> meta: Meta;
+@group(0) @binding(7) var<storage, read> prm: Meta;
 
 @compute @workgroup_size({{WG}})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
   let i = gid.y * (nwg.x * {{WG}}u) + gid.x;
-  let hp = meta.hd / 2u;
-  let nq = meta.heads * hp;
-  let nk = meta.kvheads * hp;
-  let kvd = meta.kvheads * meta.hd;
+  let hp = prm.hd / 2u;
+  let nq = prm.heads * hp;
+  let nk = prm.kvheads * hp;
+  let kvd = prm.kvheads * prm.hd;
   let pos = state[0];
   if (i < nq) {
     let h = i / hp;
     let p = i % hp;
     let c = cs[(pos * hp + p) * 2u];
     let s = cs[(pos * hp + p) * 2u + 1u];
-    let a = q[h * meta.hd + 2u * p];
-    let b = q[h * meta.hd + 2u * p + 1u];
-    q[h * meta.hd + 2u * p] = a * c - b * s;
-    q[h * meta.hd + 2u * p + 1u] = a * s + b * c;
+    let a = q[h * prm.hd + 2u * p];
+    let b = q[h * prm.hd + 2u * p + 1u];
+    q[h * prm.hd + 2u * p] = a * c - b * s;
+    q[h * prm.hd + 2u * p + 1u] = a * s + b * c;
   } else if (i < nq + nk) {
     let j = i - nq;
     let h = j / hp;
     let p = j % hp;
     let c = cs[(pos * hp + p) * 2u];
     let s = cs[(pos * hp + p) * 2u + 1u];
-    let a = kin[h * meta.hd + 2u * p];
-    let b = kin[h * meta.hd + 2u * p + 1u];
-    kc[pos * kvd + h * meta.hd + 2u * p] = a * c - b * s;
-    kc[pos * kvd + h * meta.hd + 2u * p + 1u] = a * s + b * c;
+    let a = kin[h * prm.hd + 2u * p];
+    let b = kin[h * prm.hd + 2u * p + 1u];
+    kc[pos * kvd + h * prm.hd + 2u * p] = a * c - b * s;
+    kc[pos * kvd + h * prm.hd + 2u * p + 1u] = a * s + b * c;
   } else if (i < nq + nk + kvd) {
     let j = i - nq - nk;
     vc[pos * kvd + j] = vin[j];
@@ -285,24 +285,24 @@ struct Meta { heads: u32, kvheads: u32, hd: u32, ctx: u32, scale: f32 }
 @group(0) @binding(3) var<storage, read_write> sc: array<f32>;
 @group(0) @binding(4) var<storage, read_write> outv: array<f32>;
 @group(0) @binding(5) var<storage, read> state: array<u32>;
-@group(0) @binding(6) var<storage, read> meta: Meta;
+@group(0) @binding(6) var<storage, read> prm: Meta;
 
 @compute @workgroup_size({{WG}})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let h = wid.x;
-  let kvh = h / (meta.heads / meta.kvheads);
+  let kvh = h / (prm.heads / prm.kvheads);
   let n = state[0] + 1u;
-  let kvd = meta.kvheads * meta.hd;
-  let sb = h * meta.ctx;
+  let kvd = prm.kvheads * prm.hd;
+  let sb = h * prm.ctx;
   var mx = -3.0e38;
   var t = li;
   loop {
     if (t >= n) { break; }
     var s = 0.0;
-    for (var d = 0u; d < meta.hd; d = d + 1u) {
-      s = s + q[h * meta.hd + d] * kc[t * kvd + kvh * meta.hd + d];
+    for (var d = 0u; d < prm.hd; d = d + 1u) {
+      s = s + q[h * prm.hd + d] * kc[t * kvd + kvh * prm.hd + d];
     }
-    s = s * meta.scale;
+    s = s * prm.scale;
     sc[sb + t] = s;
     mx = max(mx, s);
     t = t + {{WG}}u;
@@ -322,12 +322,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   workgroupBarrier();
   var oc = li;
   loop {
-    if (oc >= meta.hd) { break; }
+    if (oc >= prm.hd) { break; }
     var o = 0.0;
     for (var u = 0u; u < n; u = u + 1u) {
-      o = o + sc[sb + u] * vc[u * kvd + kvh * meta.hd + oc];
+      o = o + sc[sb + u] * vc[u * kvd + kvh * prm.hd + oc];
     }
-    outv[h * meta.hd + oc] = o / gsum;
+    outv[h * prm.hd + oc] = o / gsum;
     oc = oc + {{WG}}u;
   }
 }
@@ -338,12 +338,12 @@ const kernelSwiGLU = `
 struct Meta { n: u32 }
 @group(0) @binding(0) var<storage, read_write> g: array<f32>;
 @group(0) @binding(1) var<storage, read> u: array<f32>;
-@group(0) @binding(2) var<storage, read> meta: Meta;
+@group(0) @binding(2) var<storage, read> prm: Meta;
 
 @compute @workgroup_size({{WG}})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
-  if (i < meta.n) {
+  if (i < prm.n) {
     let v = g[i];
     g[i] = v / (1.0 + exp(-v)) * u[i];
   }
@@ -359,7 +359,7 @@ struct Meta { n: u32 }
 @group(0) @binding(1) var<storage, read_write> tokens: array<u32>;
 @group(0) @binding(2) var<storage, read_write> outv: array<u32>;
 @group(0) @binding(3) var<storage, read> state: array<u32>;
-@group(0) @binding(4) var<storage, read> meta: Meta;
+@group(0) @binding(4) var<storage, read> prm: Meta;
 var<workgroup> bv: array<f32, {{WG}}>;
 var<workgroup> bi: array<u32, {{WG}}>;
 
@@ -369,7 +369,7 @@ fn main(@builtin(local_invocation_index) li: u32) {
   var bidx = 0u;
   var i = li;
   loop {
-    if (i >= meta.n) { break; }
+    if (i >= prm.n) { break; }
     let v = logits[i];
     if (v > best) { best = v; bidx = i; }
     i = i + {{WG}}u;
@@ -423,4 +423,14 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b[i:])
+}
+
+// Shaders returns every kernel's WGSL for workgroup size wg, by name: for
+// tools that validate them (cmd/wgsldump).
+func Shaders(wg int) map[string]string {
+	return map[string]string{
+		"embed": wgsl(kernelEmbed, wg), "rms": wgsl(kernelRMS, wg), "q40": wgsl(kernelMatvecQ40, wg), "q41": wgsl(kernelMatvecQ41, wg),
+		"q80": wgsl(kernelMatvecQ80, wg), "rope": wgsl(kernelRopeKV, wg), "attn": wgsl(kernelAttn, wg), "swi": wgsl(kernelSwiGLU, wg),
+		"argmax": wgsl(kernelArgmax, wg), "adv": wgsl(kernelAdvance, wg),
+	}
 }

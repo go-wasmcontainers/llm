@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 
 	"github.com/go-wasmcontainers/llm/gguf"
 )
@@ -22,6 +23,10 @@ type CPU struct {
 	k, v      [][]float32 // per layer: ctx * kvHeads * headDim
 	pos       int
 	maxCtx    int
+	// MaxLayers, when non-zero, runs only that many layers and returns nil
+	// (debugging); LastX is the residual stream after the layers run.
+	MaxLayers int
+	LastX     []float32
 }
 
 type cpuTensor struct {
@@ -235,7 +240,11 @@ func (m *CPU) Forward(tok int32) []float32 {
 		y := quantizeQ8(v)
 		return &y
 	}
-	for l := 0; l < c.Layers; l++ {
+	nl := c.Layers
+	if m.MaxLayers != 0 {
+		nl = min(nl, max(m.MaxLayers, 0))
+	}
+	for l := 0; l < nl; l++ {
 		p := fmt.Sprintf("blk.%d.", l)
 		rmsNorm(h, x, f32s(m.tensor(p+"attn_norm.weight").data), c.Eps)
 		qh := prep(h)
@@ -298,6 +307,11 @@ func (m *CPU) Forward(tok int32) []float32 {
 		for i := range x {
 			x[i] += dn[i]
 		}
+	}
+	m.LastX = slices.Clone(x)
+	if m.MaxLayers != 0 && m.MaxLayers < c.Layers {
+		m.pos++
+		return nil
 	}
 	rmsNorm(h, x, f32s(m.tensor("output_norm.weight").data), c.Eps)
 	logits := make([]float32, c.Vocab)
