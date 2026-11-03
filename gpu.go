@@ -665,6 +665,9 @@ type Timing struct {
 	Generated       int
 	Submits         int
 	Dispatches      int
+	// Decode time split: the guest recording the pass (Go, in wasm), and
+	// Submit (the crossing, the replay, the GPU, the read-back).
+	Record, Submit time.Duration
 }
 
 // Generate decodes greedily: the prompt in submits of PrefillChunk tokens,
@@ -704,6 +707,7 @@ func (g *GPU) Generate(prompt []int32, n int, eos int32, emit func(int32) bool) 
 		if !emit(tok) || i == n-1 {
 			break
 		}
+		ta := time.Now()
 		rec := g.dev.NewRecorder()
 		p := rec.BeginComputePass()
 		g.token(p, true)
@@ -712,9 +716,12 @@ func (g *GPU) Generate(prompt []int32, n int, eos int32, emit func(int32) bool) 
 		}
 		rec.CopyBufferToBuffer(g.outb, 0, g.outRead, 0, 4)
 		rb = rec.ReadBuffer(g.outRead, 0, 4)
+		tb := time.Now()
 		if _, err := rec.Submit(); err != nil {
 			return tm, err
 		}
+		tm.Record += tb.Sub(ta)
+		tm.Submit += time.Since(tb)
 		g.Stats.Submits++
 	}
 	tm.Decode = time.Since(t1)

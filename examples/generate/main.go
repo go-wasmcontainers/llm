@@ -119,6 +119,10 @@ func report(tm llm.Timing) {
 	fmt.Printf("prefill: %d tokens in %.1f ms = %.1f tok/s\n", tm.PromptTokens, ms(tm.Prefill), float64(tm.PromptTokens)/tm.Prefill.Seconds())
 	fmt.Printf("decode: %d tokens in %.1f ms = %.1f tok/s (%d submits, %d dispatches in all)\n", tm.Generated, ms(tm.Decode),
 		float64(tm.Generated)/tm.Decode.Seconds(), tm.Submits, tm.Dispatches)
+	if tm.Generated > 1 {
+		fmt.Printf("decode per token: %.2f ms recording in the guest, %.2f ms in submit (crossing, replay, GPU, read-back)\n",
+			ms(tm.Record)/float64(tm.Generated-1), ms(tm.Submit)/float64(tm.Generated-1))
+	}
 }
 
 func check(g *llm.GPU, f *gguf.File, r io.ReaderAt, tok *llm.Tokenizer, prompt string, n, ctx int) {
@@ -178,6 +182,7 @@ func bench(g *llm.GPU, tok *llm.Tokenizer, rounds, p, n int) {
 		pre = append(pre, float64(tm.PromptTokens)/tm.Prefill.Seconds())
 		dec = append(dec, float64(tm.Generated)/tm.Decode.Seconds())
 		fmt.Printf("round %d: prefill %.1f tok/s, decode %.1f tok/s\n", i, pre[len(pre)-1], dec[len(dec)-1])
+		report(tm)
 	}
 	slices.Sort(pre)
 	slices.Sort(dec)

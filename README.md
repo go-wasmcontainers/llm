@@ -58,3 +58,32 @@ Model files are never committed; tests that need them skip without
   relative to the largest logit, and equal greedy tokens. Fused
   multiply-adds and a different `exp` on another vendor move the last bits.
 - GPU against llama.cpp (**vendor-sensitive**): as the CPU path above.
+
+## Results (2026-11-03, Apple M4 Max, Chromium, Metal, f32 kernels)
+
+SmolLM2-135M-Instruct Q4_0, one container, greedy, 128-token prompt and 128
+generated tokens, five interleaved rounds against llama.cpp 0.8.0 on one CPU
+core (`llama-bench -t 1 -ngl 0`, the go-pkgx bottle, openssl 3.5.8), 1-minute
+load 6.4 to 7.7:
+
+| | prefill tok/s (p50, min-max) | decode tok/s (p50, min-max) |
+|---|---|---|
+| container, WebGPU, f32 | 311 (302-318) | 171 (160-176) |
+| llama.cpp CPU, one core | 1286 (1278-1289) | 529 (521-531) |
+| WebLLM q4f32_1 (baseline, go-wasmcontainers/gpu docs/llm-baseline) | 2656 | 224 |
+
+**Slower than the one-core CPU reference: an open defect, not yet optimised
+(faithful port first).** Where the decode time goes (per token, 405 dispatches):
+0.13-0.2 ms recording in the guest, 3.8 ms (short context) to 5.5-6 ms (context
+of 128 to 192) in `submit`, of which about 0.4 ms is the crossing (measured
+separately, docs/llm-design.md). So the GPU work itself, about 9 us per
+dispatch of tiny kernels (a 576-wide row is 72 words for 64 threads), and an
+attention kernel with one workgroup per head that walks the context serially,
+are the cause. Prefill is a decode pass per prompt token (8 per submit):
+no matrix-matrix kernel yet.
+
+Correctness: on four fixed prompts the container's 32 greedy tokens equal
+llama.cpp's on two; the other two diverge at the 10th and 22nd token at a
+near-tie of llama.cpp's own distribution (0.16 and 0.12 nats), exactly as the Go
+CPU path (f32) does. GPU against CPU path: logits within 1.6e-6 relative,
+16 of 16 tokens equal.
