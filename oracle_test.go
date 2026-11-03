@@ -48,6 +48,15 @@ const (
 	minEqual        = 6    // tokens that must agree before any divergence
 )
 
+// oracleRecord is what llama.cpp (llama-server 0.8.0, CPU, one thread, greedy)
+// produced for a prompt: the data the browser test compares the GPU with.
+type oracleRecord struct {
+	Prompt    string     `json:"prompt"`
+	PromptIDs []int32    `json:"prompt_ids"`
+	Tokens    []int32    `json:"tokens"`
+	Steps     [][]refTop `json:"steps"` // llama.cpp's top-10 log-probabilities at every generated token
+}
+
 type server struct {
 	base string
 	cmd  *exec.Cmd
@@ -166,6 +175,15 @@ func TestOracleLlamaCpp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var record []oracleRecord
+	defer func() {
+		if out := os.Getenv("LLM_ORACLE_OUT"); out != "" && !t.Failed() {
+			b, _ := json.MarshalIndent(record, "", " ")
+			if err := os.WriteFile(out, append(b, '\n'), 0o644); err != nil {
+				t.Error(err)
+			}
+		}
+	}()
 	for _, prompt := range oraclePrompts {
 		var ref refResult
 		srv.post(t, "/completion", map[string]any{"prompt": prompt, "n_predict": oracleTokens, "temperature": 0,
@@ -183,6 +201,7 @@ func TestOracleLlamaCpp(t *testing.T) {
 			t.Fatalf("%q: reference returned %d tokens, %d probs", prompt, len(ref.Tokens), len(ref.Probs))
 		}
 		ref.Tokens = ref.Tokens[:oracleTokens]
+		record = append(record, oracleRecord{Prompt: prompt, PromptIDs: ids, Tokens: ref.Tokens, Steps: stepTops(ref)})
 		for _, exact := range []bool{true, false} {
 			m.ExactGGML = exact
 			got, l1 := generate(m, ids, oracleTokens)
@@ -227,4 +246,12 @@ func TestOracleLlamaCpp(t *testing.T) {
 			}
 		}
 	}
+}
+
+func stepTops(r refResult) [][]refTop {
+	var out [][]refTop
+	for i := 0; i < oracleTokens && i < len(r.Probs); i++ {
+		out = append(out, r.Probs[i].Top)
+	}
+	return out
 }
