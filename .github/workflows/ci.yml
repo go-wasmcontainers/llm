@@ -1,0 +1,83 @@
+name: ci
+on: { push: { branches: [main] }, pull_request: {} }
+permissions: { contents: read }
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version: '1.27.3' }
+      - run: go version
+      - name: nothing big is tracked
+        shell: bash
+        run: |
+          big=$(git ls-files -z | xargs -0 -I{} find {} -size +1M 2>/dev/null || true)
+          if [ -n "$big" ]; then
+            echo "::error::tracked files over 1 MB:"; echo "$big"; exit 1
+          fi
+      - name: gofmt
+        shell: bash
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "::error::not gofmt-ed:"; echo "$out"; exit 1; fi
+      - run: go vet ./...
+      - run: CGO_ENABLED=0 go build ./...
+      # The oracle tests need LLM_MODELS and llama-server and skip here.
+      - run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+  # The GGUF header comes from an untrusted model file: fuzzed on every change.
+  fuzz:
+    name: fuzz smoke FuzzParse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version: '1.27.3' }
+      - run: go version
+      - run: go test -run '^$' -fuzz '^FuzzParse$' -fuzztime 45s ./gguf
+
+  vulns:
+    name: govulncheck, judged by vulngate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version: '1.27.3' }
+      - run: go version
+      - name: govulncheck, judged by vulngate
+        run: |
+          set -eu
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/go-fleettools/fleettools/cmd/vulngate@v0.20.1
+          BIN="$(go env GOPATH)/bin"
+          "$BIN/govulncheck" -format json ./... > /tmp/vuln.json || true
+          test -s /tmp/vuln.json || { echo "::error::govulncheck wrote nothing at all"; exit 1; }
+          "$BIN/vulngate" -go "$(go env GOVERSION)" /tmp/vuln.json
+
+  # The container runs as wasip1.
+  wasm:
+    name: build and vet for wasip1/wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version: '1.27.3' }
+      - run: go version
+      - run: GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go build ./...
+      - run: GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go vet ./...
