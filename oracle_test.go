@@ -62,7 +62,7 @@ type server struct {
 	cmd  *exec.Cmd
 }
 
-func startServer(t *testing.T, model string) *server {
+func startServer(t *testing.T, model string, extra ...string) *server {
 	bin, err := exec.LookPath("llama-server")
 	if err != nil {
 		t.Skip("llama-server not in PATH")
@@ -72,6 +72,7 @@ func startServer(t *testing.T, model string) *server {
 	l.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, bin, "-m", model, "-t", "1", "-ngl", "0", "-c", "512", "--port", fmt.Sprint(port), "--host", "127.0.0.1", "--no-warmup")
+	cmd.Args = append(cmd.Args, extra...)
 	cmd.Stdin = nil
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -254,4 +255,125 @@ func stepTops(r refResult) [][]refTop {
 		out = append(out, r.Probs[i].Top)
 	}
 	return out
+}
+
+const dequantFile = "SmolLM2-135M-Instruct-Q4_0-dequant-F32.gguf"
+
+// TestOracleDequantizedF32 compares the f32-activation path with llama.cpp
+// running the SAME weights dequantised to F32 by llama.cpp's own tool
+// (llama-quantize --allow-requantize IN OUT F32): both sides then multiply f32
+// activations by identical f32 weights, so what differs is only the order of
+// summation. Skips without LLM_MODELS/dequantFile.
+func TestOracleDequantizedF32(t *testing.T) {
+	dir := os.Getenv("LLM_MODELS")
+	if dir == "" {
+		t.Skip("LLM_MODELS not set")
+	}
+	ref := filepath.Join(dir, dequantFile)
+	if _, err := os.Stat(ref); err != nil {
+		t.Skip(err)
+	}
+	fh, err := os.Open(filepath.Join(dir, modelFile))
+	if err != nil {
+		t.Skip(err)
+	}
+	defer fh.Close()
+	st, _ := fh.Stat()
+	f, err := gguf.Parse(fh, uint64(st.Size()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := NewTokenizer(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// f32 KV cache and no flash attention as well: llama.cpp's default cache is
+	// f16, which alone moves the step-1 logits by about 2e-3 to 5e-3 nats.
+	srv := startServer(t, ref, "--cache-type-k", "f32", "--cache-type-v", "f32", "-fa", "off")
+	m, err := LoadCPU(f, fh, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record []oracleRecord
+	for _, prompt := range oraclePrompts {
+		var r refResult
+		srv.post(t, "/completion", map[string]any{"prompt": prompt, "n_predict": oracleTokens, "temperature": 0,
+			"return_tokens": true, "n_probs": 10, "cache_prompt": false, "seed": 1}, &r)
+		ids := tok.Encode(prompt)
+		r.Tokens = r.Tokens[:oracleTokens]
+		record = append(record, oracleRecord{Prompt: prompt, PromptIDs: ids, Tokens: r.Tokens, Steps: stepTops(r)})
+		for _, exact := range []bool{false, true} {
+			m.ExactGGML = exact
+			got, l1 := generate(m, ids, oracleTokens)
+			same := 0
+			for same < oracleTokens && got[same] == r.Tokens[same] {
+				same++
+			}
+			lp := logSoftmax(l1)
+			var worst float64
+			top := r.Probs[0].Top
+			for _, c := range top[1:] {
+				worst = math.Max(worst, math.Abs((lp[c.ID]-lp[top[0].ID])-(c.Logprob-top[0].Logprob)))
+			}
+			t.Logf("%q f32 reference, ours exact=%v: %d/%d tokens equal, step-1 max |dlogprob| %.2e", prompt, exact, same, oracleTokens, worst)
+			if !exact && (same != oracleTokens || worst > f32RefTol) {
+				t.Errorf("%q: f32 path against the f32 reference: %d/%d tokens, step-1 difference %.2e (tolerance %.0e)", prompt, same, oracleTokens, worst, f32RefTol)
+			}
+		}
+	}
+	if out := os.Getenv("LLM_ORACLE_OUT_F32"); out != "" && !t.Failed() {
+		b, _ := json.MarshalIndent(record, "", " ")
+		if err := os.WriteFile(out, append(b, '\n'), 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// f32RefTol: step-1 log-probability differences between the f32 path and
+// llama.cpp on identical f32 weights (summation order only).
+const f32RefTol = 1e-4 // measured 1.4e-5 at most
+
+// TestQuantisedActivationsAmplifyRounding: with Q8_0 activations, a rounding
+// difference of 1e-7 in the RMSNorm sum (float32 against float64) moves the
+// step-1 logits by about as much as the whole quantisation noise: no
+// emulation that is not bit-exact can match llama.cpp's Q4_0 run to 1e-3, and
+// the f32 path does not have this property (the perturbation moves it by
+// about 1e-6). Needs LLM_MODELS.
+func TestQuantisedActivationsAmplifyRounding(t *testing.T) {
+	dir := os.Getenv("LLM_MODELS")
+	if dir == "" {
+		t.Skip("LLM_MODELS not set")
+	}
+	fh, err := os.Open(filepath.Join(dir, modelFile))
+	if err != nil {
+		t.Skip(err)
+	}
+	defer fh.Close()
+	st, _ := fh.Stat()
+	f, _ := gguf.Parse(fh, uint64(st.Size()))
+	tok, _ := NewTokenizer(f)
+	m, _ := LoadCPU(f, fh, 256)
+	defer func() { rmsF64 = false }()
+	for _, prompt := range oraclePrompts {
+		ids := tok.Encode(prompt)
+		for _, exact := range []bool{false, true} {
+			m.ExactGGML = exact
+			rmsF64 = false
+			_, a := generate(m, ids, 1)
+			rmsF64 = true
+			_, b := generate(m, ids, 1)
+			la, lb := logSoftmax(a), logSoftmax(b)
+			ta := int(Argmax(a))
+			var worst float64
+			for i := range la {
+				if la[i] > la[ta]-6 { // the candidates that matter
+					worst = math.Max(worst, math.Abs((la[i]-la[ta])-(lb[i]-lb[ta])))
+				}
+			}
+			t.Logf("%q Q8 activations=%v: RMSNorm float32 against float64 moves the step-1 logits by %.2e nats", prompt, exact, worst)
+			if !exact && worst > 1e-4 {
+				t.Errorf("the f32 path moved by %.2e", worst)
+			}
+		}
+	}
 }

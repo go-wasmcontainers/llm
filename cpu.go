@@ -19,10 +19,13 @@ import (
 type CPU struct {
 	Cfg       Config
 	ExactGGML bool
-	w         map[string]*cpuTensor
-	k, v      [][]float32 // per layer: ctx * kvHeads * headDim
-	pos       int
-	maxCtx    int
+	// F16KV alone stores the KV cache in binary16 (what llama.cpp's default
+	// cache type does) without quantising activations.
+	F16KV  bool
+	w      map[string]*cpuTensor
+	k, v   [][]float32 // per layer: ctx * kvHeads * headDim
+	pos    int
+	maxCtx int
 	// MaxLayers, when non-zero, runs only that many layers and returns nil
 	// (debugging); LastX is the residual stream after the layers run.
 	MaxLayers int
@@ -71,10 +74,22 @@ func (m *CPU) tensor(name string) *cpuTensor {
 	return t
 }
 
+// rmsF64 sums the squares in float64: a perturbation of about 1e-7 relative
+// (tests of how an activation-quantised path amplifies rounding differences).
+var rmsF64 bool
+
 func rmsNorm(dst, x, w []float32, eps float32) {
 	var ss float32
-	for _, v := range x {
-		ss += v * v
+	if rmsF64 {
+		var s float64
+		for _, v := range x {
+			s += float64(v) * float64(v)
+		}
+		ss = float32(s)
+	} else {
+		for _, v := range x {
+			ss += v * v
+		}
 	}
 	s := float32(1 / math.Sqrt(float64(ss/float32(len(x))+eps)))
 	for i, v := range x {
@@ -254,7 +269,7 @@ func (m *CPU) Forward(tok int32) []float32 {
 		rope(q, m.pos, c.Heads, c.HeadDim, c.RopeBase)
 		rope(kk, m.pos, c.KVHeads, c.HeadDim, c.RopeBase)
 		for i := 0; i < kvd; i++ {
-			if m.ExactGGML {
+			if m.ExactGGML || m.F16KV {
 				m.k[l][m.pos*kvd+i], m.v[l][m.pos*kvd+i] = RoundF16(kk[i]), RoundF16(vv[i])
 			} else {
 				m.k[l][m.pos*kvd+i], m.v[l][m.pos*kvd+i] = kk[i], vv[i]

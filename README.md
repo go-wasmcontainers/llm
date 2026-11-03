@@ -44,20 +44,33 @@ Model files are never committed; tests that need them skip without
 `LLM_MODELS`. The GPU oracle runs in the browser from go-wasmcontainers/gpu
 (`LLM_REPO=... go test -tags e2e ./e2e -run TestLLMOracle`).
 
-### Oracle tolerances (vendor-sensitive tests are marked)
+### Oracle (vendor-sensitive tests are marked)
 
 - Tokenizer: ids identical to llama.cpp's `/tokenize` on the fixed prompts.
-- CPU path against llama.cpp (`TestOracleLlamaCpp`, one thread, greedy):
-  a token differing from llama.cpp's is accepted only at a near-tie of
-  llama.cpp's own distribution (gap at most 0.25 nats) after at least 6
-  equal tokens; step-1 log-probability differences against its top-10 stay
-  within 0.5 nats. Measured: the ggml-exact mode (Q8_0 activations, f16 KV
-  cache) does not reproduce llama.cpp to 1e-3, so no tighter bound is
-  claimed.
-- GPU against the CPU f32 path (**vendor-sensitive**): logits within 1e-3
-  relative to the largest logit, and equal greedy tokens. Fused
-  multiply-adds and a different `exp` on another vendor move the last bits.
-- GPU against llama.cpp (**vendor-sensitive**): as the CPU path above.
+- **Strict oracle: llama.cpp on the same weights dequantised to F32.**
+  `llama-quantize --allow-requantize SmolLM2-135M-Instruct-Q4_0.gguf OUT.gguf F32`
+  (llama.cpp's own tool, so the weights are identical) run with
+  `--cache-type-k f32 --cache-type-v f32 -fa off`: f32 activations, f32
+  cache. `TestOracleDequantizedF32`: the Go CPU f32 path gives **32 of 32
+  greedy tokens on all four prompts** and step-1 log-probability differences
+  of at most 1.4e-5 nats (tolerance 1e-4). The GPU container is held to the
+  same tokens (**vendor-sensitive**: it differs from the CPU path by 1.6e-6
+  relative in logits on Apple Metal; another vendor's fused multiply-adds and
+  `exp` move the last bits, and a token flips only at a gap that small).
+- **Why llama.cpp's Q4_0 CPU run differs (about 0.1 to 0.4 nats at step 1).**
+  On CPU ggml quantises the *activations* to Q8_0 (Q8_1 for Q4_1 weights)
+  before every quantised matrix product (`vec_dot_q4_0_q8_0`), our f32 path
+  does not. The Go CPU path can emulate it (`ExactGGML`: Q8_0/Q8_1 activations,
+  f16 KV cache) and that is **not** enough to match to 1e-3: such a path
+  amplifies rounding by about 10^6 (`TestQuantisedActivationsAmplifyRounding`:
+  summing the RMSNorm squares in float64 instead of float32, a 1e-7 change,
+  moves the emulated logits by 0.12 to 0.24 nats and the f32 path by 1e-5), so
+  only a bit-exact port of ggml's CPU kernels could match. The default f16 KV
+  cache adds about 1e-3 to 5e-3. So the Q4_0 run is compared only
+  loosely (`TestOracleLlamaCpp`): a token differing is accepted at a near-tie
+  of llama.cpp's own distribution (at most 0.25 nats, after 6 equal tokens)
+  and step-1 differences within 0.5 nats; on two of four prompts the f32
+  path diverges from it at the 10th and 22nd token.
 
 ## Results (2026-11-03, Apple M4 Max, Chromium, Metal, f32 kernels)
 
