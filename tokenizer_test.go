@@ -2,6 +2,7 @@ package llm
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -47,5 +48,28 @@ func TestF16RoundTrip(t *testing.T) {
 	}
 	if F32ToF16(1) != 0x3c00 || F16ToF32(0x3c00) != 1 || F32ToF16(65520) != 0x7c00 {
 		t.Fatal("known values")
+	}
+}
+
+// The qwen2 pre-tokenizer on cases worked out from llama.cpp's regex
+// (llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2); the browser-free oracle test
+// TestOracleQwenDequantizedF32 compares the token ids with llama.cpp's.
+func TestSplitQwen2(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want []string
+	}{
+		{"It's DON'T", []string{"It", "'s", " DON", "'T"}},
+		{"a\n\n  b", []string{"a", "\n\n", " ", " b"}},
+		{"x = 12", []string{"x", " =", " ", "1", "2"}},
+		{"end ", []string{"end", " "}},
+		{"$$ hi", []string{"$$", " hi"}},
+		{"line\r\n\r\nnext", []string{"line", "\r\n\r\n", "next"}},
+		{"", nil},
+	} {
+		got := splitQwen2(c.in)
+		if strings.Join(got, "|") != strings.Join(c.want, "|") {
+			t.Errorf("%q: %q, want %q", c.in, got, c.want)
+		}
 	}
 }

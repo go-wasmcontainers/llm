@@ -70,6 +70,13 @@ type mat struct {
 	bytes    uint64
 }
 
+// headMV is one product of the output matrix: kernel, bind group, rows.
+type headMV struct {
+	kn   string
+	bg   *webgpu.BindGroup
+	rows int
+}
+
 type layerBG struct {
 	rms1, q, k, v, rope, attn, o, rms2, gate, up, swi, down *webgpu.BindGroup
 	fx                                                      *fusedBG // the fused form (fused.go), when set the fields above are not
@@ -92,7 +99,8 @@ type GPU struct {
 	layers []layerBG
 	embed  *webgpu.BindGroup
 	rmsF   *webgpu.BindGroup
-	logitB *webgpu.BindGroup
+	heads  []headMV // the output matrix (one product per row range)
+	embedK string   // the embedding gather kernel: "embed" (Q8_0) or "embed40" (Q4_0)
 	argmax *webgpu.BindGroup
 	adv    *webgpu.BindGroup
 
@@ -250,12 +258,28 @@ func (g *GPU) metaBuf(u *uploader, vals ...uint32) (*webgpu.Buffer, error) {
 // blocks of the file become aligned arrays (packed quants as u32 words,
 // scales and minima as f32, exact from binary16).
 func (g *GPU) loadMat(u *uploader, f *gguf.File, r io.ReaderAt, name string) (*mat, error) {
-	t, ok := f.Tensor(name)
+	return g.loadMatRows(u, f, r, name, 0, -1)
+}
+
+// loadMatRows streams rows row0..row0+rows of a matrix (all of them with
+// rows < 0): a matrix whose quants exceed the adapter's binding size goes to
+// the GPU in several row ranges.
+func (g *GPU) loadMatRows(u *uploader, f *gguf.File, r io.ReaderAt, name string, row0, rows int) (*mat, error) {
+	t0, ok := f.Tensor(name)
 	if !ok {
 		return nil, fmt.Errorf("llm: missing tensor %s", name)
 	}
-	if len(t.Dims) != 2 {
+	if len(t0.Dims) != 2 {
 		return nil, fmt.Errorf("llm: tensor %s is not a matrix", name)
+	}
+	_, bb0, _ := t0.Type.BlockSize()
+	st := *t0
+	t := &st
+	if rows >= 0 {
+		rowBytes := t0.Dims[0] / 32 * bb0
+		st.Offset += uint64(row0) * rowBytes
+		st.Size = uint64(rows) * rowBytes
+		st.Dims = []uint64{t0.Dims[0], uint64(rows)}
 	}
 	m := &mat{typ: t.Type, in: int(t.Dims[0]), out: int(t.Dims[1])}
 	_, bb, _ := t.Type.BlockSize()
@@ -361,6 +385,12 @@ func (g *GPU) grid(rows int) (x, y uint32) {
 
 // mvBind makes the bind group of a matrix product y (+)= W x.
 func (g *GPU) mvBind(u *uploader, m *mat, x, y *webgpu.Buffer, acc bool) (*webgpu.BindGroup, error) {
+	return g.mvBindAt(u, m, x, y, 0, acc)
+}
+
+// mvBindAt is mvBind writing the result at float yoff of y (a multiple of the
+// adapter's storage-buffer offset alignment, 64 floats).
+func (g *GPU) mvBindAt(u *uploader, m *mat, x, y *webgpu.Buffer, yoff int, acc bool) (*webgpu.BindGroup, error) {
 	nx, _ := g.grid(m.out)
 	a := uint32(0)
 	if acc {
@@ -375,16 +405,25 @@ func (g *GPU) mvBind(u *uploader, m *mat, x, y *webgpu.Buffer, acc bool) (*webgp
 		kn   = "q80"
 		err2 error
 	)
+	var ys []webgpu.BindGroupEntry
+	yb := webgpu.BindGroupEntry{Buffer: y}
+	if yoff != 0 {
+		yb.Offset, yb.Size = uint64(4*yoff), uint64(4*m.out)
+	}
+	bufs := []*webgpu.Buffer{m.qs, m.d, x}
 	switch m.typ {
 	case gguf.TypeQ4_0:
 		kn = "q40"
-		bg, err2 = g.bind(kn, m.qs, m.d, x, y, meta)
 	case gguf.TypeQ4_1:
 		kn = "q41"
-		bg, err2 = g.bind(kn, m.qs, m.d, m.m, x, y, meta)
-	default:
-		bg, err2 = g.bind(kn, m.qs, m.d, x, y, meta)
+		bufs = []*webgpu.Buffer{m.qs, m.d, m.m, x}
 	}
+	for i, b := range bufs {
+		ys = append(ys, webgpu.BindGroupEntry{Binding: uint32(i), Buffer: b})
+	}
+	yb.Binding = uint32(len(bufs))
+	ys = append(ys, yb, webgpu.BindGroupEntry{Binding: yb.Binding + 1, Buffer: meta})
+	bg, err2 = g.dev.CreateBindGroup(webgpu.BindGroupDescriptor{Layout: g.k[kn].bgl, Entries: ys})
 	if err2 == nil {
 		g.kinds[bg] = kn
 	}
@@ -406,7 +445,7 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 		return nil, errors.New("llm: adapter limits below WebGPU's defaults")
 	}
 	for _, k := range []struct{ n, src, acc string }{
-		{"embed", kernelEmbed, "rrrwrr"}, {"rms", kernelRMS, "rrwr"},
+		{"embed", kernelEmbed, "rrrwrr"}, {"embed40", kernelEmbedQ40, "rrrwrr"}, {"rms", kernelRMS, "rrwr"},
 		{"q40", kernelMatvecQ40, "rrrwr"}, {"q41", kernelMatvecQ41, "rrrrwr"}, {"q80", kernelMatvecQ80, "rrrwr"},
 		{"rope", kernelRopeKV, "wrrwwrrr"}, {"attn", kernelAttn, "rrrwwrr"}, {"swi", kernelSwiGLU, "wrr"},
 		{"argmax", kernelArgmax, "rwwrr"}, {"adv", kernelAdvance, "w"},
@@ -475,14 +514,19 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	if err != nil {
 		return nil, err
 	}
-	if emb.typ != gguf.TypeQ8_0 {
-		return nil, errors.New("llm: token_embd.weight must be Q8_0")
+	switch emb.typ {
+	case gguf.TypeQ8_0:
+		g.embedK = "embed"
+	case gguf.TypeQ4_0:
+		g.embedK = "embed40"
+	default:
+		return nil, errors.New("llm: token_embd.weight must be Q8_0 or Q4_0")
 	}
 	embMeta, err := g.metaBuf(u, uint32(c.Embd))
 	if err != nil {
 		return nil, err
 	}
-	if g.embed, err = g.bind("embed", tokens, emb.qs, emb.d, x, state, embMeta); err != nil {
+	if g.embed, err = g.bind(g.embedK, tokens, emb.qs, emb.d, x, state, embMeta); err != nil {
 		return nil, err
 	}
 	rmsMeta, err := g.metaBuf(u, uint32(c.Embd), math.Float32bits(c.Eps))
@@ -506,8 +550,42 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	if g.rmsF, err = g.bind("rms", x, nw, h, rmsMeta); err != nil {
 		return nil, err
 	}
-	if g.logitB, err = g.mvBind(u, emb, h, logits, false); err != nil {
-		return nil, err
+	if c.TiedOutput {
+		bg, err := g.mvBind(u, emb, h, logits, false)
+		if err != nil {
+			return nil, err
+		}
+		g.heads = append(g.heads, headMV{g.mvk(bg), bg, c.Vocab})
+	} else {
+		// A separate output matrix, in row ranges whose quants fit the
+		// adapter's binding size (rows a multiple of 64: the offset of a
+		// range in the logits must be a multiple of 256 bytes).
+		ot, ok := f.Tensor("output.weight")
+		if !ok || len(ot.Dims) != 2 || int(ot.Dims[0]) != c.Embd || int(ot.Dims[1]) != c.Vocab {
+			return nil, errors.New("llm: output.weight is not [embd, vocab]")
+		}
+		_, bb, _ := ot.Type.BlockSize()
+		qb := uint64(16)
+		if ot.Type == gguf.TypeQ8_0 {
+			qb = 32
+		}
+		rowQ := uint64(c.Embd/32) * qb
+		per := int(g.lim.MaxBindingSize/rowQ) / 64 * 64
+		if per < 64 {
+			return nil, fmt.Errorf("llm: a row of output.weight (%d bytes) does not fit the binding size %d", rowQ, g.lim.MaxBindingSize)
+		}
+		_ = bb
+		for r0 := 0; r0 < c.Vocab; r0 += per {
+			part, err := g.loadMatRows(u, f, r, "output.weight", r0, min(per, c.Vocab-r0))
+			if err != nil {
+				return nil, err
+			}
+			bg, err := g.mvBindAt(u, part, h, logits, r0, false)
+			if err != nil {
+				return nil, err
+			}
+			g.heads = append(g.heads, headMV{g.mvk(bg), bg, part.out})
+		}
 	}
 	argMeta, err := g.metaBuf(u, uint32(c.Vocab))
 	if err != nil {
@@ -575,6 +653,9 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	for l := 0; l < c.Layers; l++ {
 		p := fmt.Sprintf("blk.%d.", l)
 		var lb layerBG
+		if (c.Bias || c.RopeNeox) && (NoFused || !g.fusedOK() || !layerFusable(f, p)) {
+			return nil, fmt.Errorf("llm: %s (biases, NEOX rope) needs the fused kernels, which do not apply to layer %d on this adapter or with these tensor types", c.Arch, l)
+		}
 		if !NoFused && g.fusedOK() && layerFusable(f, p) {
 			dt, _ := f.Tensor(p + "ffn_down.weight")
 			if g.pv == nil {
@@ -681,7 +762,7 @@ func (g *GPU) groups(threads int) (x, y uint32) {
 func (g *GPU) token(p *webgpu.ComputePassRecorder, head bool) {
 	c := g.Cfg
 	kvd := c.KVHeads * c.HeadDim
-	g.dispatch(p, "embed", g.embed, 1, 1)
+	g.dispatch(p, g.embedK, g.embed, 1, 1)
 	mvx := func(rows int) (uint32, uint32) { return g.grid(rows) }
 	rx, ry := g.groups((c.Heads+c.KVHeads)*c.HeadDim/2 + kvd)
 	sx, sy := g.groups(c.FF)

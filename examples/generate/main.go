@@ -24,6 +24,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -138,6 +139,9 @@ func report(tm llm.Timing) {
 }
 
 func check(g *llm.GPU, f *gguf.File, r io.ReaderAt, tok *llm.Tokenizer, prompt string, n, ctx int) {
+	// The CPU path holds the whole model in memory (428 MB for Qwen2.5-0.5B):
+	// a collector that lets the heap double would exhaust the guest's memory.
+	debug.SetGCPercent(10)
 	ids := tok.Encode(prompt)
 	gl, err := g.PrefillLogits(ids)
 	if err != nil {

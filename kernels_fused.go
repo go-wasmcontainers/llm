@@ -48,8 +48,8 @@ const fusedEpiQKV = `
   if (li < RPW / 2u) {
     let rr = wg * RPW + 2u * li;
     if (rr < ROWS) {
-      let a = red[(2u * li) * TPR];
-      let b = red[(2u * li + 1u) * TPR];
+      let a = red[(2u * li) * TPR]{{BIASA}};
+      let b = red[(2u * li + 1u) * TPR]{{BIASB}};
       let pos = state[0] + tk;
       if (rr < NQ + NK) {
         var j = rr;
@@ -214,7 +214,14 @@ func fusedMVSource(s mvSpec, k mvKind, extra map[string]int) (src, access string
 		h.Bindings = []q4.Binding{{Name: "q", Type: "array<f32>", RW: true}, {Name: "kv", Type: "array<f32>", RW: true},
 			{Name: "state", Type: "array<u32>"}, {Name: "cs", Type: "array<f32>"}}
 		h.Decl = consts("NQ", "NK", "HD", "HP", "KVD", "CTXKVD")
-		h.RowMap, h.Epi = q4.RowPlain, fusedEpiQKV
+		// Biases of the three projections follow the norm weights in aux
+		// (qwen2); the rows of Q and K are in the order loadGroup leaves them.
+		ba, bb := "", ""
+		if extra["BIAS"] == 1 {
+			h.Decl += consts("BO")
+			ba, bb = " + aux[BO + rr]", " + aux[BO + rr + 1u]"
+		}
+		h.RowMap, h.Epi = q4.RowPlain, strings.NewReplacer("{{BIASA}}", ba, "{{BIASB}}", bb).Replace(fusedEpiQKV)
 	case "gateup":
 		sp.Mode = q4.Custom
 		h.Bindings = []q4.Binding{{Name: "act", Type: "array<f32>", RW: true}}
