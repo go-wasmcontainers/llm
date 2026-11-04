@@ -20,9 +20,10 @@ First model: SmolLM2-135M-Instruct Q4_0 (Q4_0, Q4_1 and Q8_0 tensors).
 - **Streaming load.** Weights go from the file to the GPU in 16 MiB pieces,
   repacked per block (18-byte Q4_0 blocks become aligned `u32` quants and
   `f32` scales); the model never sits in guest memory.
-- **One submit per token.** Every dispatch of the forward pass is recorded
-  into one compute pass; sampling (`argmax`) runs on the GPU and only the
-  4-byte token is read back. Prompt tokens go in submits of 8.
+- **Eight tokens per submit.** Every dispatch of the forward pass is recorded
+  into compute passes; sampling (`argmax`) runs on the GPU and only the
+  sampled tokens are read back, once per 8. Prompt tokens go through the
+  layers in chunks of up to 64.
 - **Vendor-neutral f32.** No subgroups, no `shader-f16`. The workgroup size
   (64, lower if the adapter's invocation or workgroup-memory limit is lower),
   the 2-D grids and the buffer sizes come from the adapter limits the host
