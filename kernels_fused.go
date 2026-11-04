@@ -43,6 +43,7 @@ var<workgroup> xs: array<vec4<f32>, {{TILE4}}>;
 @compute @workgroup_size({{WG}})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let wg = wid.y * NX + wid.x;
+  let tk = wid.z;
   let lr = li / TPR;
   let ln = li % TPR;
   {{ROWMAP}}
@@ -121,14 +122,14 @@ const fusedPreRMS = `
   var si = li;
   loop {
     if (si >= N / 4u) { break; }
-    let v = x4[si];
+    let v = x4[tk * (N / 4u) + si];
     ss = ss + dot(v, v);
     si = si + WG;
   }
   let rs = 1.0 / sqrt(rsum(li, ss) / f32(N) + EPS);
 `
 
-const fusedLoadRMS = `x4[gi] * rs * vec4<f32>(aux[NW + 4u * gi], aux[NW + 4u * gi + 1u], aux[NW + 4u * gi + 2u], aux[NW + 4u * gi + 3u])`
+const fusedLoadRMS = `x4[tk * (N / 4u) + gi] * rs * vec4<f32>(aux[NW + 4u * gi], aux[NW + 4u * gi + 1u], aux[NW + 4u * gi + 2u], aux[NW + 4u * gi + 3u])`
 
 // Row maps. Plain: row = wg*RPW + lr. Gate/up: a workgroup computes RPW/2
 // rows of gate and the same rows of up (the matrices are concatenated
@@ -141,9 +142,9 @@ const fusedRowGateUp = `
   let row = select(orow, F + orow, lr >= hh);`
 
 const fusedEpiStore = `
-  if (ln == 0u && valid) { y[row] = red[li]; }`
+  if (ln == 0u && valid) { y[tk * ROWS + row] = red[li]; }`
 const fusedEpiAcc = `
-  if (ln == 0u && valid) { y[row] = y[row] + red[li]; }`
+  if (ln == 0u && valid) { y[tk * ROWS + row] = y[tk * ROWS + row] + red[li]; }`
 
 const fusedEpiGateUp = `
   if (li < RPW / 2u) {
@@ -151,7 +152,7 @@ const fusedEpiGateUp = `
     if (o < F) {
       let g = red[li * TPR];
       let u = red[(li + RPW / 2u) * TPR];
-      act[o] = g / (1.0 + exp(-g)) * u;
+      act[tk * F + o] = g / (1.0 + exp(-g)) * u;
     }
   }`
 
@@ -164,7 +165,7 @@ const fusedEpiQKV = `
     if (rr < ROWS) {
       let a = red[(2u * li) * TPR];
       let b = red[(2u * li + 1u) * TPR];
-      let pos = state[0];
+      let pos = state[0] + tk;
       if (rr < NQ + NK) {
         var j = rr;
         if (rr >= NQ) { j = rr - NQ; }
@@ -174,7 +175,7 @@ const fusedEpiQKV = `
         let ra = a * c - b * sn;
         let rb = a * sn + b * c;
         if (rr < NQ) {
-          q[rr] = ra; q[rr + 1u] = rb;
+          q[tk * NQ + rr] = ra; q[tk * NQ + rr + 1u] = rb;
         } else {
           kv[pos * KVD + j] = ra; kv[pos * KVD + j + 1u] = rb;
         }
@@ -200,6 +201,7 @@ const GQ: u32 = {{GQ}}u;
 const G: u32 = {{G}}u;
 const WG: u32 = {{WG}}u;
 const S: u32 = {{S}}u;
+const H: u32 = {{H}}u;
 const SCALE: f32 = {{SCALE}};
 @group(0) @binding(0) var<storage, read> q4: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> kv4: array<vec4<f32>>;
@@ -219,10 +221,12 @@ var<workgroup> part: array<vec4<f32>, {{WG}}>;
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let c = wid.x;
   let h = wid.y;
+  let tk = wid.z;
   let kvh = h / GQ;
-  let n = state[0] + 1u;
+  let n = state[0] + tk + 1u;
   let p = c * WG + li;
-  if (li < HD4) { qh[li] = q4[h * HD4 + li]; }
+  let th = tk * H + h;
+  if (li < HD4) { qh[li] = q4[th * HD4 + li]; }
   workgroupBarrier();
   var s = -3.0e38;
   if (p < n) {
@@ -253,19 +257,19 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < HD4) {
     var tot = part[li];
     for (var k = 1u; k < G; k = k + 1u) { tot = tot + part[li + k * HD4]; }
-    pv[(h * S + c) * HD4 + li] = tot;
+    pv[(th * S + c) * HD4 + li] = tot;
   }
-  if (li == 0u) { ml[h * S + c] = vec2<f32>(m, l); }
+  if (li == 0u) { ml[th * S + c] = vec2<f32>(m, l); }
 }
 `
 
 // The merge of the chunks of a head, as the input stage of K3: element gi (a
 // vec4 of the concatenated heads) is sum_c exp(m_c-M) pv_c / sum_c exp(m_c-M) l_c.
 const fusedCombine = `
-fn combine(gi: u32) -> vec4<f32> {
-  let h = gi / HD4;
+fn combine(gi: u32, tk: u32) -> vec4<f32> {
+  let h = tk * (N / 4u / HD4) + gi / HD4;
   let d4 = gi % HD4;
-  let sn = (state[0] + WG) / WG;
+  let sn = (state[0] + tk + WG) / WG;
   var mx = -3.0e38;
   for (var c = 0u; c < S; c = c + 1u) {
     if (c >= sn) { break; }
@@ -373,10 +377,10 @@ func fusedMVSource(s mvSpec, k mvKind, extra map[string]int) (src, access string
 		decl += bind("state", "array<u32>", false)
 		decl += "const HD4: u32 = " + itoa(extra["HD4"]) + "u;\nconst S: u32 = " + itoa(extra["S"]) + "u;\n"
 		blockFn += fusedCombine
-		load = "combine(gi)"
+		load = "combine(gi, tk)"
 	} else {
 		decl += bind("x4", "array<vec4<f32>>", false)
-		load = "x4[gi]"
+		load = "x4[tk * (N / 4u) + gi]"
 	}
 	switch k.mode {
 	case "qkv":
@@ -411,7 +415,7 @@ func fusedMVSource(s mvSpec, k mvKind, extra map[string]int) (src, access string
 func fusedAttnSource(wg, hd, heads, kvheads, ctx int, scale float32) string {
 	kvd := kvheads * hd
 	return strings.NewReplacer("{{HD4}}", itoa(hd/4), "{{KVD4}}", itoa(kvd/4), "{{CTXKVD4}}", itoa(ctx*kvd/4), "{{CTX}}", itoa(ctx),
-		"{{GQ}}", itoa(heads/kvheads), "{{G}}", itoa(wg/(hd/4)), "{{S}}", itoa((ctx+wg-1)/wg), "{{SCALE}}", f32lit(scale), "{{WG}}", itoa(wg)).Replace(fusedAttn)
+		"{{GQ}}", itoa(heads/kvheads), "{{G}}", itoa(wg/(hd/4)), "{{S}}", itoa((ctx+wg-1)/wg), "{{H}}", itoa(heads), "{{SCALE}}", f32lit(scale), "{{WG}}", itoa(wg)).Replace(fusedAttn)
 }
 
 // fusedShaders returns the fused kernels for a sample model (SmolLM2-135M's

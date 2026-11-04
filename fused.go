@@ -195,16 +195,68 @@ func (g *GPU) fusedLayer(u *uploader, f *gguf.File, r io.ReaderAt, p string, x, 
 	return &fb, nil
 }
 
-func (g *GPU) dispatchGrid(p *webgpu.ComputePassRecorder, kn string, bg *webgpu.BindGroup) {
+func (g *GPU) dispatchGrid(p *webgpu.ComputePassRecorder, kn string, bg *webgpu.BindGroup, m int) {
 	gr := g.fgrid[kn]
-	g.dispatch(p, kn, bg, gr.x, gr.y)
+	g.dispatch3(p, kn, bg, gr.x, gr.y, uint32(m))
 }
 
-// recordFused records the five dispatches of a fused layer.
-func (g *GPU) recordFused(p *webgpu.ComputePassRecorder, l *fusedBG) {
-	g.dispatchGrid(p, "k1", l.k1)
-	g.dispatch(p, "k2", l.k2, uint32((g.pos+g.wg)/g.wg), uint32(g.Cfg.Heads))
-	g.dispatchGrid(p, "k3", l.k3)
-	g.dispatchGrid(p, "k4", l.k4)
-	g.dispatchGrid(p, l.k5n, l.k5)
+// recordFused records the five dispatches of a fused layer for m tokens at
+// the positions g.pos, g.pos+1, ... (the z axis of every dispatch is the
+// token). The attention of token t sees positions up to g.pos+t.
+func (g *GPU) recordFused(p *webgpu.ComputePassRecorder, l *fusedBG, m int) {
+	g.dispatchGrid(p, "k1", l.k1, m)
+	g.dispatch3(p, "k2", l.k2, uint32((g.pos+m+g.wg-1)/g.wg), uint32(g.Cfg.Heads), uint32(m))
+	g.dispatchGrid(p, "k3", l.k3, m)
+	g.dispatchGrid(p, "k4", l.k4, m)
+	g.dispatchGrid(p, l.k5n, l.k5, m)
+}
+
+// recordHead records the final norm, the logits and the sampling of the token
+// whose residual stream is x[0:Embd].
+func (g *GPU) recordHead(p *webgpu.ComputePassRecorder, fromLast bool) {
+	c := g.Cfg
+	if fromLast {
+		g.dispatch(p, "rms", g.rmsL, 1, 1)
+	} else {
+		g.dispatch(p, "rms", g.rmsF, 1, 1)
+	}
+	x, y := g.grid(c.Vocab)
+	g.dispatch(p, "q80", g.logitB, x, y)
+	if g.am1 != nil {
+		g.dispatch(p, "am1", g.am1, argmaxGroups, 1)
+		g.dispatch(p, "am2", g.am2, 1, 1)
+	} else {
+		g.dispatch(p, "argmax", g.argmax, 1, 1)
+	}
+}
+
+// chunk records m prompt tokens through the fused layers; with last, the
+// final token's logits and its sampled token too (a second pass: the
+// residual stream of the last token is first copied to the front of x).
+func (g *GPU) chunk(rec *webgpu.Recorder, m int, last bool) error {
+	adv := m
+	if last {
+		adv = m - 1
+	}
+	rec.WriteBuffer(g.advNA, 0, le32(uint32(adv)))
+	p := rec.BeginComputePass()
+	g.dispatch3(p, "embed", g.embed, 1, 1, uint32(m))
+	for _, l := range g.layers {
+		g.recordFused(p, l.fx, m)
+	}
+	if adv > 0 {
+		g.dispatch(p, "advn", g.advA, 1, 1)
+	}
+	if err := p.End(); err != nil {
+		return err
+	}
+	g.pos += m
+	if !last {
+		return nil
+	}
+	rec.CopyBufferToBuffer(g.xbuf, uint64(4*(m-1)*g.Cfg.Embd), g.xlast, 0, uint64(4*g.Cfg.Embd))
+	p = rec.BeginComputePass()
+	g.recordHead(p, true)
+	g.dispatch(p, "advn", g.advB, 1, 1)
+	return p.End()
 }

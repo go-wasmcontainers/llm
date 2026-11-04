@@ -111,7 +111,20 @@ type GPU struct {
 	pv, ml *webgpu.Buffer
 	am1    *webgpu.BindGroup // two-stage argmax (fused.go), nil with NoFused
 	am2    *webgpu.BindGroup
+
+	pm         int // tokens per prompt chunk (1: the token-at-a-time path)
+	xlast      *webgpu.Buffer
+	rmsL       *webgpu.BindGroup
+	xbuf       *webgpu.Buffer    // the residual stream, pm vectors
+	advA, advB *webgpu.BindGroup // state += n (n from advNA), state += 1
+	advNA      *webgpu.Buffer
 }
+
+// PrefillBatch is the number of prompt tokens the fused layers process
+// together in one pass: every weight matrix is read once per chunk and the
+// dispatches are shared. A chunk of 64 tokens takes about 12 ms of GPU time
+// on an Apple M4 Max, far below the 500 ms budget of a submit.
+var PrefillBatch = 64
 
 // NoFused turns the fused layer kernels off (the v0.2.0 path, for A/B runs).
 var NoFused bool
@@ -407,17 +420,33 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	u := &uploader{g: g}
 	mk := func(n int) (*webgpu.Buffer, error) { return g.buffer(uint64(4*n), stor) }
 	var bufs [14]*webgpu.Buffer
-	for i, n := range []int{c.Embd, c.Embd, c.Embd, kvd, kvd, c.Embd, c.FF, c.FF, c.Vocab, 2, ctx, 1, c.Heads * ctx} {
+	// A prompt chunk of pm tokens goes through the fused layers together (one
+	// dispatch per kernel for the chunk): its residual stream, queries and
+	// activations are pm vectors wide.
+	g.pm = 1
+	if !NoFused && g.fusedOK() {
+		all := true
+		for l := 0; l < c.Layers; l++ {
+			all = all && layerFusable(f, fmt.Sprintf("blk.%d.", l))
+		}
+		if all {
+			// The chunk's attention partials are pm * heads * chunks * HeadDim
+			// floats: at most 16 MiB.
+			per := 4 * c.Heads * g.chunks() * c.HeadDim
+			g.pm = max(1, min(PrefillBatch, int(lim.MaxWorkgroupsPerDimension), (16<<20)/per))
+		}
+	}
+	for i, n := range []int{c.Embd * g.pm, c.Embd, c.Embd * g.pm, kvd, kvd, c.Embd, c.FF * g.pm, c.FF, c.Vocab, 2, ctx, 1, c.Heads * ctx} {
 		if bufs[i], err = mk(n); err != nil {
 			return nil, err
 		}
 	}
 	x, h, q, kk, vv, att, gt, up, logits, state, tokens, outb, scratch := bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7], bufs[8], bufs[9], bufs[10], bufs[11], bufs[12]
-	g.state, g.tokens, g.outb, g.logits = state, tokens, outb, logits
+	g.state, g.tokens, g.outb, g.logits, g.xbuf = state, tokens, outb, logits, x
 	for n, b := range map[string]*webgpu.Buffer{"x": x, "h": h, "q": q, "k": kk, "v": vv, "att": att, "gate": gt, "up": up, "logits": logits, "state": state, "tokens": tokens, "outb": outb} {
 		g.named[n] = b
 	}
-	if g.outRead, err = g.buffer(4, webgpu.BufferUsageMapRead|webgpu.BufferUsageCopyDst); err != nil {
+	if g.outRead, err = g.buffer(4*MaxBatch, webgpu.BufferUsageMapRead|webgpu.BufferUsageCopyDst); err != nil {
 		return nil, err
 	}
 	if g.logitsRead, err = g.buffer(uint64(4*c.Vocab), webgpu.BufferUsageMapRead|webgpu.BufferUsageCopyDst); err != nil {
@@ -464,6 +493,16 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	if err != nil {
 		return nil, err
 	}
+	if g.pm > 1 {
+		// The last token of a prompt chunk is copied to xlast (a buffer cannot
+		// be copied onto itself) and the head reads it.
+		if g.xlast, err = mk(c.Embd); err != nil {
+			return nil, err
+		}
+		if g.rmsL, err = g.bind("rms", g.xlast, nw, h, rmsMeta); err != nil {
+			return nil, err
+		}
+	}
 	if g.rmsF, err = g.bind("rms", x, nw, h, rmsMeta); err != nil {
 		return nil, err
 	}
@@ -479,6 +518,24 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	}
 	if g.adv, err = g.bind("adv", state); err != nil {
 		return nil, err
+	}
+	if g.pm > 1 {
+		if err := g.newKernel("advn", kernelAdvanceN, "wr"); err != nil {
+			return nil, err
+		}
+		if g.advNA, err = g.buffer(4, stor); err != nil {
+			return nil, err
+		}
+		one, err := g.metaBuf(u, 1)
+		if err != nil {
+			return nil, err
+		}
+		if g.advA, err = g.bind("advn", state, g.advNA); err != nil {
+			return nil, err
+		}
+		if g.advB, err = g.bind("advn", state, one); err != nil {
+			return nil, err
+		}
 	}
 	if !NoFused {
 		a1, a2 := argmaxSources(g.wg, c.Vocab)
@@ -521,10 +578,10 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 		if !NoFused && g.fusedOK() && layerFusable(f, p) {
 			dt, _ := f.Tensor(p + "ffn_down.weight")
 			if g.pv == nil {
-				if g.pv, err = g.buffer(uint64(4*c.Heads*g.chunks()*c.HeadDim), stor); err != nil {
+				if g.pv, err = g.buffer(uint64(4*c.Heads*g.chunks()*c.HeadDim*g.pm), stor); err != nil {
 					return nil, err
 				}
-				if g.ml, err = g.buffer(uint64(8*c.Heads*g.chunks()), stor); err != nil {
+				if g.ml, err = g.buffer(uint64(8*c.Heads*g.chunks()*g.pm), stor); err != nil {
 					return nil, err
 				}
 			}
@@ -602,12 +659,16 @@ func (g *GPU) MemoryUsed() uint64 { return g.used }
 // profiling aid. GPU time per class is the decode time with the class minus
 // the decode time without it; the output is garbage then.
 func (g *GPU) dispatch(p *webgpu.ComputePassRecorder, kn string, bg *webgpu.BindGroup, x, y uint32) {
+	g.dispatch3(p, kn, bg, x, y, 1)
+}
+
+func (g *GPU) dispatch3(p *webgpu.ComputePassRecorder, kn string, bg *webgpu.BindGroup, x, y, z uint32) {
 	if g.Skip != nil && (g.Skip[kn] || g.Skip["all"]) {
 		return
 	}
 	p.SetPipeline(g.k[kn].pipe)
 	p.SetBindGroup(0, bg)
-	p.DispatchWorkgroups(x, y, 1)
+	p.DispatchWorkgroups(x, y, z)
 	g.Stats.Dispatches++
 }
 
@@ -631,7 +692,7 @@ func (g *GPU) token(p *webgpu.ComputePassRecorder, head bool) {
 	}
 	for _, l := range layers {
 		if l.fx != nil {
-			g.recordFused(p, l.fx)
+			g.recordFused(p, l.fx, 1)
 			continue
 		}
 		g.dispatch(p, "rms", l.rms1, 1, 1)
@@ -653,15 +714,7 @@ func (g *GPU) token(p *webgpu.ComputePassRecorder, head bool) {
 		g.dispatch(p, g.mvk(l.down), l.down, x, y)
 	}
 	if head {
-		g.dispatch(p, "rms", g.rmsF, 1, 1)
-		x, y := mvx(c.Vocab)
-		g.dispatch(p, "q80", g.logitB, x, y)
-		if g.am1 != nil {
-			g.dispatch(p, "am1", g.am1, argmaxGroups, 1)
-			g.dispatch(p, "am2", g.am2, 1, 1)
-		} else {
-			g.dispatch(p, "argmax", g.argmax, 1, 1)
-		}
+		g.recordHead(p, false)
 	}
 	g.dispatch(p, "adv", g.adv, 1, 1)
 	g.pos++
@@ -691,6 +744,26 @@ func (g *GPU) prefill(prompt []int32, lastRead func(rec *webgpu.Recorder) func()
 		return nil, errors.New("llm: empty prompt")
 	}
 	var fin func() error
+	if g.pm > 1 {
+		for a := 0; a < len(prompt); a += g.pm {
+			b := min(a+g.pm, len(prompt))
+			rec := g.dev.NewRecorder()
+			if a == 0 {
+				g.begin(rec, prompt)
+			}
+			if err := g.chunk(rec, b-a, b == len(prompt)); err != nil {
+				return nil, err
+			}
+			if b == len(prompt) {
+				fin = lastRead(rec)
+			}
+			if _, err := rec.Submit(); err != nil {
+				return nil, err
+			}
+			g.Stats.Submits++
+		}
+		return fin, nil
+	}
 	for a := 0; a < len(prompt); a += PrefillChunk {
 		b := min(a+PrefillChunk, len(prompt))
 		rec := g.dev.NewRecorder()
@@ -778,28 +851,44 @@ func (g *GPU) Generate(prompt []int32, n int, eos int32, emit func(int32) bool) 
 	tm.Prefill = time.Since(t0)
 	tm.PromptTokens = len(prompt)
 	t1 := time.Now()
-	for i := 0; i < n; i++ {
+	cnt := 1 // tokens the pending read-back holds
+	for produced := 0; produced < n; {
 		b, err := rb.Bytes()
 		if err != nil {
 			return tm, err
 		}
-		tok := int32(binary.LittleEndian.Uint32(b))
-		if tok == eos {
+		for j := 0; j < cnt && produced < n; j++ {
+			tok := int32(binary.LittleEndian.Uint32(b[4*j:]))
+			if tok == eos {
+				n = produced // stop; the tokens the GPU went on to compute are dropped
+				break
+			}
+			tm.Generated++
+			produced++
+			if !emit(tok) {
+				n = produced
+				break
+			}
+		}
+		if produced >= n {
 			break
 		}
-		tm.Generated++
-		if !emit(tok) || i == n-1 {
-			break
-		}
+		// Next submit: up to Batch tokens, each sampled on the GPU from the
+		// one before, so the 0.4 ms crossing and the read-back are paid once
+		// for Batch tokens. The sampled tokens are contiguous in tokens[].
+		cnt = min(g.batch(), n-produced)
 		ta := time.Now()
 		rec := g.dev.NewRecorder()
 		p := rec.BeginComputePass()
-		g.token(p, true)
+		first := g.pos
+		for j := 0; j < cnt; j++ {
+			g.token(p, true)
+		}
 		if err := p.End(); err != nil {
 			return tm, err
 		}
-		rec.CopyBufferToBuffer(g.outb, 0, g.outRead, 0, 4)
-		rb = rec.ReadBuffer(g.outRead, 0, 4)
+		rec.CopyBufferToBuffer(g.tokens, uint64(4*(first+1)), g.outRead, 0, uint64(4*cnt))
+		rb = rec.ReadBuffer(g.outRead, 0, uint64(4*cnt))
 		tb := time.Now()
 		if _, err := rec.Submit(); err != nil {
 			return tm, err
@@ -841,3 +930,14 @@ func (g *GPU) Peek(name string, n int) ([]float32, error) {
 	}
 	return out, nil
 }
+
+// MaxBatch bounds Batch.
+const MaxBatch = 16
+
+// DecodeBatch is the number of tokens a decode submit computes (Generate): the
+// crossing and the read-back are paid once for that many tokens. After the
+// end-of-sequence token or a stop from emit, at most DecodeBatch-1 tokens
+// have been computed for nothing.
+var DecodeBatch = 8
+
+func (g *GPU) batch() int { return max(1, min(DecodeBatch, MaxBatch)) }

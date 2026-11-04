@@ -59,8 +59,8 @@ struct Meta { n: u32 }
 
 // Q8_0 row gather: element e of the token's row is d * int8.
 @compute @workgroup_size({{WG}})
-fn main(@builtin(local_invocation_index) li: u32) {
-  let tok = tokens[state[1]];
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let tok = tokens[state[1] + wid.z];
   let nb = prm.n / 32u;
   var e = li;
   loop {
@@ -68,7 +68,7 @@ fn main(@builtin(local_invocation_index) li: u32) {
     let b = e / 32u;
     let w = qs[(tok * nb + b) * 8u + (e % 32u) / 4u];
     let v = extractBits(bitcast<i32>(w), 8u * (e % 4u), 8u);
-    x[e] = dd[tok * nb + b] * f32(v);
+    x[wid.z * prm.n + e] = dd[tok * nb + b] * f32(v);
     e = e + {{WG}}u;
   }
 }
@@ -405,6 +405,17 @@ fn main() {
 }
 `
 
+// Advance the position and the step by n tokens (n in a one-word buffer).
+const kernelAdvanceN = `
+@group(0) @binding(0) var<storage, read_write> state: array<u32>;
+@group(0) @binding(1) var<storage, read> nn: array<u32>;
+@compute @workgroup_size(1)
+fn main() {
+  state[0] = state[0] + nn[0];
+  state[1] = state[1] + nn[0];
+}
+`
+
 const prelude = wgslPrelude
 
 func wgsl(src string, wg int) string {
@@ -432,7 +443,7 @@ func Shaders(wg int) map[string]string {
 	for k, v := range map[string]string{
 		"embed": wgsl(kernelEmbed, wg), "rms": wgsl(kernelRMS, wg), "q40": wgsl(kernelMatvecQ40, wg), "q41": wgsl(kernelMatvecQ41, wg),
 		"q80": wgsl(kernelMatvecQ80, wg), "rope": wgsl(kernelRopeKV, wg), "attn": wgsl(kernelAttn, wg), "swi": wgsl(kernelSwiGLU, wg),
-		"argmax": wgsl(kernelArgmax, wg), "adv": wgsl(kernelAdvance, wg),
+		"argmax": wgsl(kernelArgmax, wg), "adv": wgsl(kernelAdvance, wg), "advn": wgsl(kernelAdvanceN, wg),
 	} {
 		m[k] = v
 	}
