@@ -1,5 +1,7 @@
-github.com/go-gfx/webgpu v0.8.0 h1:WUM49liuSy7VDAARLDH6xueJmJMxg5xV2ERxex7njUQ=
-github.com/go-gfx/webgpu v0.8.0/go.mod h1:60qAy+J79Ag1Yx5w+kGQUPbtISHuvhy4f/oZAPDeC4Y=
+github.com/go-gfx/webgpu v0.13.0 h1:RmqtIK352J10nkAN91LzRwK5JZn5nSUUFG4XyvtZWno=
+github.com/go-gfx/webgpu v0.13.0/go.mod h1:Au8Dk3erroah4RrxIOEgYK7DltdJwra7cuCz5npZaN8=
+github.com/go-gfx/wgsl v0.2.1 h1:uLlI502PbzXIAqJgRGAEzCbZEjMj0sLPfPdOvydsvJg=
+github.com/go-gfx/wgsl v0.2.1/go.mod h1:Fzzw0jXvB+zxCqmTDwvcu3B7PkIVJBcygl2dyDyDAgQ=
 github.com/go-virtio/gpu v0.10.0 h1:OQNYudPxHr8KB4e/eVRuCDGfC4+c5F/ljpUDD3A+Bg4=
 github.com/go-virtio/gpu v0.10.0/go.mod h1:xT7FjSKJXAS9+PMsP8q0lBYF/H4FTkOkKzOoM6BV3as=
 github.com/go-wasmcontainers/gpu v0.7.0 h1:LtNBtd+kJ/uYnq6LQpB4XyiyrMCSbrUyxBLyfW7YGEU=

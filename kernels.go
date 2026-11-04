@@ -12,39 +12,7 @@ import "strings"
 // two adapters with the same WG sum in the same order (fused multiply-adds
 // aside, which the compiler may introduce).
 
-const wgslPrelude = `
-var<workgroup> red: array<f32, {{WG}}>;
-
-fn rsum(li: u32, v: f32) -> f32 {
-  red[li] = v;
-  workgroupBarrier();
-  var s = {{WG}}u / 2u;
-  loop {
-    if (s == 0u) { break; }
-    if (li < s) { red[li] = red[li] + red[li + s]; }
-    workgroupBarrier();
-    s = s >> 1u;
-  }
-  let r = red[0];
-  workgroupBarrier();
-  return r;
-}
-
-fn rmax(li: u32, v: f32) -> f32 {
-  red[li] = v;
-  workgroupBarrier();
-  var s = {{WG}}u / 2u;
-  loop {
-    if (s == 0u) { break; }
-    if (li < s) { red[li] = max(red[li], red[li + s]); }
-    workgroupBarrier();
-    s = s >> 1u;
-  }
-  let r = red[0];
-  workgroupBarrier();
-  return r;
-}
-`
+// The reduction helpers rsum and rmax are q4.Prelude (wgslPrelude).
 
 // Binding access strings: 'r' read-only storage, 'w' read-write storage.
 
