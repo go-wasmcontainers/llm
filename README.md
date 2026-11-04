@@ -13,7 +13,10 @@ text on the GPU through the batched command stream of
 | `llm` (root) | byte-level BPE tokenizer (`gpt2` model, `smollm` pre-tokenizer), llama config, CPU forward pass (the oracle and native fallback), GPU forward pass and its WGSL f32 kernels |
 | `examples/generate` | the container: `run`, `check` (GPU against the CPU path), `bench` |
 
-First model: SmolLM2-135M-Instruct Q4_0 (Q4_0, Q4_1 and Q8_0 tensors).
+Models: SmolLM2-135M-Instruct Q4_0 (Q4_0, Q4_1 and Q8_0 tensors) and, since
+v0.4.0, Qwen2.5-0.5B-Instruct Q4_0 (architecture `qwen2`: NEOX rope, QKV
+biases, 151936-token vocabulary, Q4_0 embedding and a separate Q8_0 output
+matrix; `--gpu-memory 512m` suffices at context 512).
 
 ## Design points
 
@@ -86,6 +89,18 @@ change with its tok/s, loop budgets and the structural limit:
 | container v0.2.0 (same rounds) | 312 (306-321) | 154 (149-161) |
 | llama.cpp 0.8.0, one CPU core (`llama-bench -t 1 -ngl 0`, go-pkgx bottle) | 1268 (1040-1281) | 514 (499-525) |
 | WebLLM q4f32_1 (go-wasmcontainers/gpu docs/llm-baseline, not re-run) | 2656 | 224 |
+
+Qwen2.5-0.5B-Instruct Q4_0 (v0.4.0, same method, load 6):
+
+| | prefill tok/s (p50, min-max) | decode tok/s (p50, min-max) |
+|---|---|---|
+| container, WebGPU, f32 | 1908 (1899-1918) | 350 (340-354) |
+| llama.cpp 0.8.0, one CPU core | 426 (424-432) | 161 (160-162) |
+| WebLLM q4f32_1 (not re-run) | 2184 | 177 |
+
+Strict oracle: 32 of 32 greedy tokens on 4 of 4 prompts; GPU against CPU path
+4.3e-6 relative on a 137-token prompt
+([docs/perf/2026-11-04-qwen2.5-0.5b.md](docs/perf/2026-11-04-qwen2.5-0.5b.md)).
 
 v0.2.0 was slower than the one-core CPU reference (171 against 529 decode):
 405 tiny dependent dispatches and a serial attention kernel. v0.3.0 fuses a

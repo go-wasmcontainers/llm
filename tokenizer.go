@@ -17,6 +17,7 @@ import (
 // one, then the GPT-2 pattern
 // 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S).
 type Tokenizer struct {
+	pre     string // "smollm" or "qwen2"
 	tokens  []string
 	ids     map[string]int32
 	ranks   map[[2]string]int
@@ -64,8 +65,9 @@ func NewTokenizer(f *gguf.File) (*Tokenizer, error) {
 	if m, _ := f.Str("tokenizer.ggml.model"); m != "gpt2" {
 		return nil, fmt.Errorf("llm: tokenizer model %q is not supported (gpt2 only)", m)
 	}
-	if p, _ := f.Str("tokenizer.ggml.pre"); p != "smollm" {
-		return nil, fmt.Errorf("llm: pre-tokenizer %q is not supported (smollm only)", p)
+	pre, _ := f.Str("tokenizer.ggml.pre")
+	if pre != "smollm" && pre != "qwen2" {
+		return nil, fmt.Errorf("llm: pre-tokenizer %q is not supported (smollm and qwen2 only)", pre)
 	}
 	toks, _ := f.Meta["tokenizer.ggml.tokens"].([]any)
 	merges, _ := f.Meta["tokenizer.ggml.merges"].([]any)
@@ -73,7 +75,7 @@ func NewTokenizer(f *gguf.File) (*Tokenizer, error) {
 	if len(toks) == 0 {
 		return nil, errors.New("llm: no tokenizer.ggml.tokens")
 	}
-	t := &Tokenizer{ids: make(map[string]int32, len(toks)), ranks: make(map[[2]string]int, len(merges))}
+	t := &Tokenizer{pre: pre, ids: make(map[string]int32, len(toks)), ranks: make(map[[2]string]int, len(merges))}
 	for i, v := range toks {
 		s, ok := v.(string)
 		if !ok {
@@ -135,6 +137,12 @@ func (t *Tokenizer) Encode(text string) []int32 {
 }
 
 func (t *Tokenizer) encodePlain(out []int32, text string) []int32 {
+	if t.pre == "qwen2" {
+		for _, piece := range splitQwen2(text) {
+			out = t.bpe(out, piece)
+		}
+		return out
+	}
 	for _, seg := range splitDigits(text) {
 		for _, piece := range splitGPT2(seg) {
 			out = t.bpe(out, piece)
@@ -290,4 +298,100 @@ func (t *Tokenizer) Piece(id int32) []byte {
 		}
 	}
 	return b
+}
+
+// splitQwen2 is llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN2 pattern (llama-vocab.cpp),
+// by hand (no look-ahead in Go's regexp), alternatives tried in order:
+//
+//	(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+//	[^\r\n\p{L}\p{N}]?\p{L}+
+//	\p{N}
+//	 ?[^\s\p{L}\p{N}]+[\r\n]*
+//	\s*[\r\n]+
+//	\s+(?!\S)
+//	\s+
+func splitQwen2(s string) []string {
+	rs := []rune(s)
+	n := len(rs)
+	isNL := func(r rune) bool { return r == '\r' || r == '\n' }
+	isL := unicode.IsLetter
+	isN := unicode.IsNumber
+	var out []string
+	for i := 0; i < n; {
+		end := -1
+		// 1: contractions, ASCII case-insensitive
+		if rs[i] == '\'' {
+			for _, c := range []string{"s", "t", "re", "ve", "m", "ll", "d"} {
+				if i+1+len(c) <= n && strings.EqualFold(string(rs[i+1:i+1+len(c)]), c) {
+					end = i + 1 + len(c)
+					break
+				}
+			}
+		}
+		// 2: an optional non-letter, non-number, non-newline, then letters
+		if end < 0 {
+			j := i
+			if !isNL(rs[j]) && !isL(rs[j]) && !isN(rs[j]) {
+				j++
+			}
+			if j < n && isL(rs[j]) {
+				for j < n && isL(rs[j]) {
+					j++
+				}
+				end = j
+			}
+		}
+		// 3: one number character
+		if end < 0 && isN(rs[i]) {
+			end = i + 1
+		}
+		// 4: an optional space, symbols, newlines
+		if end < 0 {
+			j := i
+			if rs[j] == ' ' {
+				j++
+			}
+			k := j
+			for k < n && !isSpace(rs[k]) && !isL(rs[k]) && !isN(rs[k]) {
+				k++
+			}
+			if k > j {
+				for k < n && isNL(rs[k]) {
+					k++
+				}
+				end = k
+			}
+		}
+		// 5: whitespace up to and including the last newline of the run
+		if end < 0 && isSpace(rs[i]) {
+			k := i
+			for k < n && isSpace(rs[k]) {
+				k++
+			}
+			for e := k; e > i; e-- {
+				if isNL(rs[e-1]) {
+					end = e
+					break
+				}
+			}
+			// 6: the run, less its last character when a non-space follows
+			if end < 0 {
+				e := k
+				if e < n {
+					e--
+				}
+				if e > i {
+					end = e
+				} else {
+					end = k // 7: \s+
+				}
+			}
+		}
+		if end < 0 { // nothing matches: one character
+			end = i + 1
+		}
+		out = append(out, string(rs[i:end]))
+		i = end
+	}
+	return out
 }

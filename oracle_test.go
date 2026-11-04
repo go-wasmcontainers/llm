@@ -265,6 +265,23 @@ const dequantFile = "SmolLM2-135M-Instruct-Q4_0-dequant-F32.gguf"
 // activations by identical f32 weights, so what differs is only the order of
 // summation. Skips without LLM_MODELS/dequantFile.
 func TestOracleDequantizedF32(t *testing.T) {
+	oracleDequantized(t, modelFile, dequantFile, "LLM_ORACLE_OUT_F32", true)
+}
+
+const (
+	qwenFile        = "qwen2.5-0.5b-instruct-q4_0.gguf"
+	qwenDequantFile = "qwen2.5-0.5b-instruct-q4_0-dequant-F32.gguf"
+)
+
+// TestOracleQwenDequantizedF32 is the same strict oracle for Qwen2.5-0.5B
+// (NEOX rope, QKV biases, Q4_0 token embedding, separate Q8_0 output matrix,
+// qwen2 pre-tokenizer): LLM_MODELS holds both files; the token ids of the
+// prompts must equal llama.cpp's /tokenize, the f32 path its 32 greedy tokens.
+func TestOracleQwenDequantizedF32(t *testing.T) {
+	oracleDequantized(t, qwenFile, qwenDequantFile, "LLM_ORACLE_OUT_QWEN", false)
+}
+
+func oracleDequantized(t *testing.T, modelFile, dequantFile, outEnv string, alsoExact bool) {
 	dir := os.Getenv("LLM_MODELS")
 	if dir == "" {
 		t.Skip("LLM_MODELS not set")
@@ -295,14 +312,37 @@ func TestOracleDequantizedF32(t *testing.T) {
 		t.Fatal(err)
 	}
 	var record []oracleRecord
+	// Pre-tokenizer corner cases: contractions in both cases, newlines and
+	// runs of spaces, digits, symbols, accents, a trailing space.
+	for _, s := range []string{"It's DON'T I'LL we've  two  spaces", "a\n\n  b\r\n c\t d", "x = 3.14159 + 42;  # ok", "naïve café — 你好 😀", "end ", " \n", "'tis 'S 'Re"} {
+		var tk struct {
+			Tokens []int32 `json:"tokens"`
+		}
+		srv.post(t, "/tokenize", map[string]any{"content": s}, &tk)
+		if ids := tok.Encode(s); !slices.Equal(ids, tk.Tokens) {
+			t.Errorf("%q: tokenizer\n ours %v\n ref  %v", s, ids, tk.Tokens)
+		}
+	}
 	for _, prompt := range oraclePrompts {
 		var r refResult
 		srv.post(t, "/completion", map[string]any{"prompt": prompt, "n_predict": oracleTokens, "temperature": 0,
 			"return_tokens": true, "n_probs": 10, "cache_prompt": false, "seed": 1}, &r)
+		var tk struct {
+			Tokens []int32 `json:"tokens"`
+		}
+		srv.post(t, "/tokenize", map[string]any{"content": prompt}, &tk)
 		ids := tok.Encode(prompt)
+		if !slices.Equal(ids, tk.Tokens) {
+			t.Errorf("%q: tokenizer\n ours %v\n ref  %v", prompt, ids, tk.Tokens)
+			continue
+		}
 		r.Tokens = r.Tokens[:oracleTokens]
 		record = append(record, oracleRecord{Prompt: prompt, PromptIDs: ids, Tokens: r.Tokens, Steps: stepTops(r)})
-		for _, exact := range []bool{false, true} {
+		modes := []bool{false}
+		if alsoExact {
+			modes = []bool{false, true}
+		}
+		for _, exact := range modes {
 			m.ExactGGML = exact
 			got, l1 := generate(m, ids, oracleTokens)
 			same := 0
@@ -321,7 +361,7 @@ func TestOracleDequantizedF32(t *testing.T) {
 			}
 		}
 	}
-	if out := os.Getenv("LLM_ORACLE_OUT_F32"); out != "" && !t.Failed() {
+	if out := os.Getenv(outEnv); out != "" && !t.Failed() {
 		b, _ := json.MarshalIndent(record, "", " ")
 		if err := os.WriteFile(out, append(b, '\n'), 0o644); err != nil {
 			t.Error(err)

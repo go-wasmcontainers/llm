@@ -229,13 +229,28 @@ func (m *CPU) Forward(tok int32) []float32 {
 	}
 	x := make([]float32, c.Embd)
 	emb := m.tensor("token_embd.weight")
-	rowBytes := c.Embd / 32 * 34
-	row := emb.data[int(tok)*rowBytes : (int(tok)+1)*rowBytes]
-	for b := 0; b < c.Embd/32; b++ { // dequantise one Q8_0 row
-		d := F16ToF32(u16(row[b*34:]))
-		for j := 0; j < 32; j++ {
-			x[b*32+j] = d * float32(int8(row[b*34+2+j]))
+	switch emb.t.Type { // dequantise one row
+	case gguf.TypeQ8_0:
+		rowBytes := c.Embd / 32 * 34
+		row := emb.data[int(tok)*rowBytes : (int(tok)+1)*rowBytes]
+		for b := 0; b < c.Embd/32; b++ {
+			d := F16ToF32(u16(row[b*34:]))
+			for j := 0; j < 32; j++ {
+				x[b*32+j] = d * float32(int8(row[b*34+2+j]))
+			}
 		}
+	case gguf.TypeQ4_0:
+		rowBytes := c.Embd / 32 * 18
+		row := emb.data[int(tok)*rowBytes : (int(tok)+1)*rowBytes]
+		for b := 0; b < c.Embd/32; b++ {
+			d := F16ToF32(u16(row[b*18:]))
+			for j := 0; j < 16; j++ {
+				x[b*32+j] = d * float32(int(row[b*18+2+j]&15)-8)
+				x[b*32+j+16] = d * float32(int(row[b*18+2+j]>>4)-8)
+			}
+		}
+	default:
+		panic(fmt.Sprintf("llm: CPU embedding: ggml type %d", emb.t.Type))
 	}
 	h := make([]float32, c.Embd)
 	q := make([]float32, c.Heads*c.HeadDim)
@@ -266,8 +281,19 @@ func (m *CPU) Forward(tok int32) []float32 {
 		m.matvec(q, h, m.tensor(p+"attn_q.weight"), qh)
 		m.matvec(kk, h, m.tensor(p+"attn_k.weight"), qh)
 		m.matvec(vv, h, m.tensor(p+"attn_v.weight"), qh)
-		rope(q, m.pos, c.Heads, c.HeadDim, c.RopeBase)
-		rope(kk, m.pos, c.KVHeads, c.HeadDim, c.RopeBase)
+		if c.Bias {
+			for i, b := range f32s(m.tensor(p + "attn_q.bias").data) {
+				q[i] += b
+			}
+			for i, b := range f32s(m.tensor(p + "attn_k.bias").data) {
+				kk[i] += b
+			}
+			for i, b := range f32s(m.tensor(p + "attn_v.bias").data) {
+				vv[i] += b
+			}
+		}
+		rope(q, m.pos, c.Heads, c.HeadDim, c.RopeBase, c.RopeNeox)
+		rope(kk, m.pos, c.KVHeads, c.HeadDim, c.RopeBase, c.RopeNeox)
 		for i := 0; i < kvd; i++ {
 			if m.ExactGGML || m.F16KV {
 				m.k[l][m.pos*kvd+i], m.v[l][m.pos*kvd+i] = RoundF16(kk[i]), RoundF16(vv[i])
@@ -330,21 +356,30 @@ func (m *CPU) Forward(tok int32) []float32 {
 	}
 	rmsNorm(h, x, f32s(m.tensor("output_norm.weight").data), c.Eps)
 	logits := make([]float32, c.Vocab)
-	m.matvec(logits, h, emb, prep(h)) // tied output embedding
+	out := emb // tied output embedding
+	if !c.TiedOutput {
+		out = m.tensor("output.weight")
+	}
+	m.matvec(logits, h, out, prep(h))
 	m.pos++
 	return logits
 }
 
-// rope rotates adjacent pairs (llama.cpp rope type NORM): pair i of a head
-// turns by pos * base^(-2i/dim).
-func rope(x []float32, pos, heads, dim int, base float32) {
+// rope rotates pairs: adjacent elements (llama.cpp rope type NORM) or, with
+// neox, elements i and i+dim/2 (type NEOX); pair i of a head turns by
+// pos * base^(-2i/dim).
+func rope(x []float32, pos, heads, dim int, base float32, neox bool) {
 	for h := 0; h < heads; h++ {
 		for i := 0; i < dim/2; i++ {
 			theta := float64(pos) * math.Pow(float64(base), -float64(2*i)/float64(dim))
 			s, c := math.Sincos(theta)
-			a, b := x[h*dim+2*i], x[h*dim+2*i+1]
-			x[h*dim+2*i] = a*float32(c) - b*float32(s)
-			x[h*dim+2*i+1] = a*float32(s) + b*float32(c)
+			ia, ib := h*dim+2*i, h*dim+2*i+1
+			if neox {
+				ia, ib = h*dim+i, h*dim+i+dim/2
+			}
+			a, b := x[ia], x[ib]
+			x[ia] = a*float32(c) - b*float32(s)
+			x[ib] = a*float32(s) + b*float32(c)
 		}
 	}
 }
