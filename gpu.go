@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-gfx/webgpu"
+	"github.com/go-gfx/webgpu/kernels/q4"
 	"github.com/go-wasmcontainers/llm/gguf"
 )
 
@@ -72,9 +73,38 @@ type mat struct {
 
 // headMV is one product of the output matrix: kernel, bind group, rows.
 type headMV struct {
-	kn   string
-	bg   *webgpu.BindGroup
-	rows int
+	kn    string
+	bg    *webgpu.BindGroup
+	rows  int
+	fused bool // a kernels/q4 kernel with its own grid (g.fgrid[kn])
+}
+
+// headBind makes the product of a rows range of the output matrix: Q8_0 goes
+// to the kernels/q4 kernel (vec4 block loads, staged input, TPR invocations per
+// row), other types, and every type with NoFused, to the v0.2.0 kernels. The
+// result goes to the logits at float yoff.
+func (g *GPU) headBind(u *uploader, m *mat, x, y *webgpu.Buffer, yoff int) (headMV, error) {
+	if NoFused || m.typ != gguf.TypeQ8_0 || m.in%32 != 0 || g.wg%TPR != 0 || TPR < 2 {
+		bg, err := g.mvBindAt(u, m, x, y, yoff, false)
+		return headMV{g.mvk(bg), bg, m.out, false}, err
+	}
+	name := fmt.Sprintf("h80_%d", m.out)
+	if _, ok := g.k[name]; !ok {
+		sp := g.spec(m.in, m.out)
+		src, access, gx, gy := q4.Source(q4.Spec{WG: sp.wg, TPR: sp.tpr, MaxShared: sp.maxShared, MaxGroups: sp.maxGroups, N: sp.n, Rows: sp.rows,
+			Eps: sp.eps, Q80: true, Mode: q4.Store}, 0)
+		if err := g.newKernel(name, src, access); err != nil {
+			return headMV{}, err
+		}
+		g.fgrid[name] = fusedGrid{uint32(gx), uint32(gy)}
+	}
+	yb := webgpu.BindGroupEntry{Binding: 3, Buffer: y}
+	if yoff != 0 {
+		yb.Offset, yb.Size = uint64(4*yoff), uint64(4*m.out)
+	}
+	bg, err := g.dev.CreateBindGroup(webgpu.BindGroupDescriptor{Layout: g.k[name].bgl, Entries: []webgpu.BindGroupEntry{
+		{Binding: 0, Buffer: m.qs}, {Binding: 1, Buffer: m.d}, {Binding: 2, Buffer: x}, yb}})
+	return headMV{name, bg, m.out, true}, err
 }
 
 type layerBG struct {
@@ -551,11 +581,11 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 		return nil, err
 	}
 	if c.TiedOutput {
-		bg, err := g.mvBind(u, emb, h, logits, false)
+		hm, err := g.headBind(u, emb, h, logits, 0)
 		if err != nil {
 			return nil, err
 		}
-		g.heads = append(g.heads, headMV{g.mvk(bg), bg, c.Vocab})
+		g.heads = append(g.heads, hm)
 	} else {
 		// A separate output matrix, in row ranges whose quants fit the
 		// adapter's binding size (rows a multiple of 64: the offset of a
@@ -580,11 +610,11 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 			if err != nil {
 				return nil, err
 			}
-			bg, err := g.mvBindAt(u, part, h, logits, r0, false)
+			hm, err := g.headBind(u, part, h, logits, r0)
 			if err != nil {
 				return nil, err
 			}
-			g.heads = append(g.heads, headMV{g.mvk(bg), bg, part.out})
+			g.heads = append(g.heads, hm)
 		}
 	}
 	argMeta, err := g.metaBuf(u, uint32(c.Vocab))
