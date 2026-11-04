@@ -199,56 +199,53 @@ const CTX: u32 = {{CTX}}u;
 const GQ: u32 = {{GQ}}u;
 const G: u32 = {{G}}u;
 const WG: u32 = {{WG}}u;
+const S: u32 = {{S}}u;
 const SCALE: f32 = {{SCALE}};
 @group(0) @binding(0) var<storage, read> q4: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> kv4: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> sc: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> pv: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> ml: array<vec2<f32>>;
 @group(0) @binding(4) var<storage, read> state: array<u32>;
 var<workgroup> qh: array<vec4<f32>, {{HD4}}>;
+var<workgroup> pw: array<f32, {{WG}}>;
 var<workgroup> part: array<vec4<f32>, {{WG}}>;
 
+// One workgroup per (chunk of WG positions, head): the partial softmax of the
+// chunk (its max m and sum l of exp(s-m)) and its weighted sum of V go to
+// ml and pv; K3 merges the chunks of a head (flash-decoding: Dao et al.), so
+// the work of a head is spread over ceil(n/WG) workgroups and no loop of an
+// invocation is longer than HD4.
 @compute @workgroup_size({{WG}})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-  let h = wid.x;
+  let c = wid.x;
+  let h = wid.y;
   let kvh = h / GQ;
   let n = state[0] + 1u;
-  let sb = h * CTX;
+  let p = c * WG + li;
   if (li < HD4) { qh[li] = q4[h * HD4 + li]; }
   workgroupBarrier();
-  var mx = -3.0e38;
-  var t = li;
-  loop {
-    if (t >= n) { break; }
-    var s = 0.0;
-    let kb = t * KVD4 + kvh * HD4;
+  var s = -3.0e38;
+  if (p < n) {
+    var a = 0.0;
+    let kb = p * KVD4 + kvh * HD4;
     for (var d = 0u; d < HD4; d = d + 1u) {
-      s = s + dot(qh[d], kv4[kb + d]);
+      a = a + dot(qh[d], kv4[kb + d]);
     }
-    s = s * SCALE;
-    sc[sb + t] = s;
-    mx = max(mx, s);
-    t = t + WG;
+    s = a * SCALE;
   }
-  let gmax = rmax(li, mx);
-  var sum = 0.0;
-  t = li;
-  loop {
-    if (t >= n) { break; }
-    let e = exp(sc[sb + t] - gmax);
-    sc[sb + t] = e;
-    sum = sum + e;
-    t = t + WG;
-  }
-  let gsum = rsum(li, sum);
-  storageBarrier();
-  workgroupBarrier();
+  let m = rmax(li, s);
+  let e = select(0.0, exp(s - m), p < n);
+  pw[li] = e;
+  let l = rsum(li, e);
   let lane = li % HD4;
   var o = vec4<f32>(0.0);
   var u = li / HD4;
   loop {
-    if (u >= n) { break; }
-    o = o + sc[sb + u] * kv4[CTXKVD4 + u * KVD4 + kvh * HD4 + lane];
+    if (u >= WG) { break; }
+    let pp = c * WG + u;
+    if (pp < n) {
+      o = o + pw[u] * kv4[CTXKVD4 + pp * KVD4 + kvh * HD4 + lane];
+    }
     u = u + G;
   }
   part[li] = o;
@@ -256,8 +253,33 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < HD4) {
     var tot = part[li];
     for (var k = 1u; k < G; k = k + 1u) { tot = tot + part[li + k * HD4]; }
-    out4[h * HD4 + li] = tot / gsum;
+    pv[(h * S + c) * HD4 + li] = tot;
   }
+  if (li == 0u) { ml[h * S + c] = vec2<f32>(m, l); }
+}
+`
+
+// The merge of the chunks of a head, as the input stage of K3: element gi (a
+// vec4 of the concatenated heads) is sum_c exp(m_c-M) pv_c / sum_c exp(m_c-M) l_c.
+const fusedCombine = `
+fn combine(gi: u32) -> vec4<f32> {
+  let h = gi / HD4;
+  let d4 = gi % HD4;
+  let sn = (state[0] + WG) / WG;
+  var mx = -3.0e38;
+  for (var c = 0u; c < S; c = c + 1u) {
+    if (c >= sn) { break; }
+    mx = max(mx, ml[h * S + c].x);
+  }
+  var l = 0.0;
+  var o = vec4<f32>(0.0);
+  for (var c = 0u; c < S; c = c + 1u) {
+    if (c >= sn) { break; }
+    let w = exp(ml[h * S + c].x - mx);
+    l = l + w * ml[h * S + c].y;
+    o = o + w * pv[(h * S + c) * HD4 + d4];
+  }
+  return o / l;
 }
 `
 
@@ -275,9 +297,10 @@ func f32lit(x float32) string { return strconv.FormatFloat(float64(x), 'e', -1, 
 // mode is "qkv", "gateup", "acc" or "store"; norm adds the RMSNorm (weights
 // at aux[nw:]) in front.
 type mvKind struct {
-	q41  bool
-	mode string
-	norm bool
+	q41    bool
+	mode   string
+	norm   bool
+	attnIn bool // the input is the merge of the attention chunks (fusedCombine)
 }
 
 func (s mvSpec) tile() (tile4, ntiles, tb int) {
@@ -344,6 +367,13 @@ func fusedMVSource(s mvSpec, k mvKind, extra map[string]int) (src, access string
 		decl += bind("x4", "array<vec4<f32>>", false)
 		pre = fusedPreRMS
 		load = fusedLoadRMS
+	} else if k.attnIn {
+		decl += bind("pv", "array<vec4<f32>>", false)
+		decl += bind("ml", "array<vec2<f32>>", false)
+		decl += bind("state", "array<u32>", false)
+		decl += "const HD4: u32 = " + itoa(extra["HD4"]) + "u;\nconst S: u32 = " + itoa(extra["S"]) + "u;\n"
+		blockFn += fusedCombine
+		load = "combine(gi)"
 	} else {
 		decl += bind("x4", "array<vec4<f32>>", false)
 		load = "x4[gi]"
@@ -381,7 +411,7 @@ func fusedMVSource(s mvSpec, k mvKind, extra map[string]int) (src, access string
 func fusedAttnSource(wg, hd, heads, kvheads, ctx int, scale float32) string {
 	kvd := kvheads * hd
 	return strings.NewReplacer("{{HD4}}", itoa(hd/4), "{{KVD4}}", itoa(kvd/4), "{{CTXKVD4}}", itoa(ctx*kvd/4), "{{CTX}}", itoa(ctx),
-		"{{GQ}}", itoa(heads/kvheads), "{{G}}", itoa(wg/(hd/4)), "{{SCALE}}", f32lit(scale), "{{WG}}", itoa(wg)).Replace(fusedAttn)
+		"{{GQ}}", itoa(heads/kvheads), "{{G}}", itoa(wg/(hd/4)), "{{S}}", itoa((ctx+wg-1)/wg), "{{SCALE}}", f32lit(scale), "{{WG}}", itoa(wg)).Replace(fusedAttn)
 }
 
 // fusedShaders returns the fused kernels for a sample model (SmolLM2-135M's
@@ -399,9 +429,105 @@ func fusedShaders(wg int) map[string]string {
 	add("k1", g.spec(c.Embd, nqkv), mvKind{mode: "qkv", norm: true}, map[string]int{
 		"NQ": c.Embd, "NK": kvd, "HD": c.HeadDim, "HP": c.HeadDim / 2, "KVD": kvd, "CTXKVD": 512 * kvd, "NW": nqkv * c.Embd / 32})
 	out["k2"] = fusedAttnSource(wg, c.HeadDim, c.Heads, c.KVHeads, 512, 0.125)
-	add("k3", g.spec(c.Embd, c.Embd), mvKind{mode: "acc"}, nil)
+	add("k3", g.spec(c.Embd, c.Embd), mvKind{mode: "acc", attnIn: true}, map[string]int{"HD4": c.HeadDim / 4, "S": (512 + wg - 1) / wg})
 	add("k4", g.spec(c.Embd, 2*c.FF), mvKind{mode: "gateup", norm: true}, map[string]int{"F": c.FF, "NW": 2 * c.FF * c.Embd / 32})
 	add("k5_0", g.spec(c.FF, c.Embd), mvKind{mode: "acc"}, nil)
 	add("k5_1", g.spec(c.FF, c.Embd), mvKind{mode: "acc", q41: true}, nil)
+	out["am1"], out["am2"] = argmaxSources(wg, 49152)
 	return out
+}
+
+// Greedy sampling in two stages, so that the 49152 logits are not walked by
+// one workgroup: NWG workgroups each reduce a slice of the logits to its
+// (largest, lowest index among equals), then one workgroup reduces the NWG
+// partials and writes the token. Ties go to the lowest index, like llama.cpp.
+const fusedArgmax1 = `
+const VOCAB: u32 = {{VOCAB}}u;
+const SL: u32 = {{SL}}u;
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> pbv: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pbi: array<u32>;
+var<workgroup> bv: array<f32, {{WG}}>;
+var<workgroup> bi: array<u32, {{WG}}>;
+
+@compute @workgroup_size({{WG}})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let lo = wid.x * SL;
+  let hi = min(lo + SL, VOCAB);
+  var best = -3.0e38;
+  var bidx = lo;
+  var i = lo + li;
+  loop {
+    if (i >= hi) { break; }
+    let v = logits[i];
+    if (v > best) { best = v; bidx = i; }
+    i = i + {{WG}}u;
+  }
+  bv[li] = best;
+  bi[li] = bidx;
+  workgroupBarrier();
+  var s = {{WG}}u / 2u;
+  loop {
+    if (s == 0u) { break; }
+    if (li < s) {
+      let ov = bv[li + s];
+      let oi = bi[li + s];
+      if (ov > bv[li] || (ov == bv[li] && oi < bi[li])) { bv[li] = ov; bi[li] = oi; }
+    }
+    workgroupBarrier();
+    s = s >> 1u;
+  }
+  if (li == 0u) { pbv[wid.x] = bv[0]; pbi[wid.x] = bi[0]; }
+}
+`
+
+const fusedArgmax2 = `
+const NWG: u32 = {{NWG}}u;
+@group(0) @binding(0) var<storage, read> pbv: array<f32>;
+@group(0) @binding(1) var<storage, read> pbi: array<u32>;
+@group(0) @binding(2) var<storage, read_write> tokens: array<u32>;
+@group(0) @binding(3) var<storage, read_write> outv: array<u32>;
+@group(0) @binding(4) var<storage, read> state: array<u32>;
+var<workgroup> bv: array<f32, {{WG}}>;
+var<workgroup> bi: array<u32, {{WG}}>;
+
+@compute @workgroup_size({{WG}})
+fn main(@builtin(local_invocation_index) li: u32) {
+  var best = -3.0e38;
+  var bidx = 0xffffffffu;
+  var i = li;
+  loop {
+    if (i >= NWG) { break; }
+    let v = pbv[i];
+    if (v > best) { best = v; bidx = pbi[i]; }
+    i = i + {{WG}}u;
+  }
+  bv[li] = best;
+  bi[li] = bidx;
+  workgroupBarrier();
+  var s = {{WG}}u / 2u;
+  loop {
+    if (s == 0u) { break; }
+    if (li < s) {
+      let ov = bv[li + s];
+      let oi = bi[li + s];
+      if (ov > bv[li] || (ov == bv[li] && oi < bi[li])) { bv[li] = ov; bi[li] = oi; }
+    }
+    workgroupBarrier();
+    s = s >> 1u;
+  }
+  if (li == 0u) {
+    tokens[state[1] + 1u] = bi[0];
+    outv[0] = bi[0];
+  }
+}
+`
+
+// argmaxGroups is NWG, the workgroups of the first stage.
+const argmaxGroups = 64
+
+func argmaxSources(wg, vocab int) (a1, a2 string) {
+	sl := (vocab + argmaxGroups - 1) / argmaxGroups
+	r := strings.NewReplacer("{{VOCAB}}", itoa(vocab), "{{SL}}", itoa(sl), "{{WG}}", itoa(wg), "{{NWG}}", itoa(argmaxGroups))
+	return r.Replace(fusedArgmax1), r.Replace(fusedArgmax2)
 }

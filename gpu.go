@@ -107,6 +107,10 @@ type GPU struct {
 	Layers int
 	Skip   map[string]bool
 	fgrid  map[string]fusedGrid
+	pos    int // the position of the next token, as the state buffer holds it on the GPU
+	pv, ml *webgpu.Buffer
+	am1    *webgpu.BindGroup // two-stage argmax (fused.go), nil with NoFused
+	am2    *webgpu.BindGroup
 }
 
 // NoFused turns the fused layer kernels off (the v0.2.0 path, for A/B runs).
@@ -476,6 +480,29 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	if g.adv, err = g.bind("adv", state); err != nil {
 		return nil, err
 	}
+	if !NoFused {
+		a1, a2 := argmaxSources(g.wg, c.Vocab)
+		if err := g.newKernel("am1", a1, "rww"); err != nil {
+			return nil, err
+		}
+		if err := g.newKernel("am2", a2, "rrwwr"); err != nil {
+			return nil, err
+		}
+		pbv, err := g.buffer(4*argmaxGroups, stor)
+		if err != nil {
+			return nil, err
+		}
+		pbi, err := g.buffer(4*argmaxGroups, stor)
+		if err != nil {
+			return nil, err
+		}
+		if g.am1, err = g.bind("am1", logits, pbv, pbi); err != nil {
+			return nil, err
+		}
+		if g.am2, err = g.bind("am2", pbv, pbi, tokens, outb, state); err != nil {
+			return nil, err
+		}
+	}
 	ropeMeta, err := g.metaBuf(u, uint32(c.Heads), uint32(c.KVHeads), uint32(c.HeadDim), uint32(ctx))
 	if err != nil {
 		return nil, err
@@ -493,10 +520,18 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 		var lb layerBG
 		if !NoFused && g.fusedOK() && layerFusable(f, p) {
 			dt, _ := f.Tensor(p + "ffn_down.weight")
+			if g.pv == nil {
+				if g.pv, err = g.buffer(uint64(4*c.Heads*g.chunks()*c.HeadDim), stor); err != nil {
+					return nil, err
+				}
+				if g.ml, err = g.buffer(uint64(8*c.Heads*g.chunks()), stor); err != nil {
+					return nil, err
+				}
+			}
 			if err := g.fusedKernels(dt.Type == gguf.TypeQ4_1); err != nil {
 				return nil, err
 			}
-			if lb.fx, err = g.fusedLayer(u, f, r, p, x, q, att, gt, scratch, state, csb); err != nil {
+			if lb.fx, err = g.fusedLayer(u, f, r, p, x, q, gt, g.pv, g.ml, state, csb); err != nil {
 				return nil, err
 			}
 			g.layers = append(g.layers, lb)
@@ -621,9 +656,15 @@ func (g *GPU) token(p *webgpu.ComputePassRecorder, head bool) {
 		g.dispatch(p, "rms", g.rmsF, 1, 1)
 		x, y := mvx(c.Vocab)
 		g.dispatch(p, "q80", g.logitB, x, y)
-		g.dispatch(p, "argmax", g.argmax, 1, 1)
+		if g.am1 != nil {
+			g.dispatch(p, "am1", g.am1, argmaxGroups, 1)
+			g.dispatch(p, "am2", g.am2, 1, 1)
+		} else {
+			g.dispatch(p, "argmax", g.argmax, 1, 1)
+		}
 	}
 	g.dispatch(p, "adv", g.adv, 1, 1)
+	g.pos++
 }
 
 // mvk returns the kernel name of a layer's bind group; the matrix types of
@@ -633,6 +674,7 @@ func (g *GPU) mvk(bg *webgpu.BindGroup) string { return g.kinds[bg] }
 // reset zeroes the position and step and loads the prompt into tokens[0:].
 func (g *GPU) begin(rec *webgpu.Recorder, prompt []int32) {
 	rec.WriteBuffer(g.state, 0, le32(0, 0))
+	g.pos = 0
 	ids := make([]uint32, len(prompt))
 	for i, t := range prompt {
 		ids[i] = uint32(t)

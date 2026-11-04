@@ -60,6 +60,9 @@ func (g *GPU) fusedKernel(name string, s mvSpec, k mvKind, extra map[string]int)
 	return nil
 }
 
+// chunks is the number of attention chunks (WG positions each) of a full context.
+func (g *GPU) chunks() int { return (g.ctx + g.wg - 1) / g.wg }
+
 func (g *GPU) spec(n, rows int) mvSpec {
 	return mvSpec{wg: g.wg, tpr: TPR, maxShared: int(g.lim.MaxWorkgroupStorage), n: n, rows: rows, maxGroups: int(g.lim.MaxWorkgroupsPerDimension), eps: g.Cfg.Eps}
 }
@@ -78,7 +81,7 @@ func (g *GPU) fusedKernels(down41 bool) error {
 			return err
 		}
 	}
-	if err := g.fusedKernel("k3", g.spec(c.Embd, c.Embd), mvKind{mode: "acc"}, nil); err != nil {
+	if err := g.fusedKernel("k3", g.spec(c.Embd, c.Embd), mvKind{mode: "acc", attnIn: true}, map[string]int{"HD4": c.HeadDim / 4, "S": g.chunks()}); err != nil {
 		return err
 	}
 	if err := g.fusedKernel("k4", g.spec(c.Embd, 2*c.FF), mvKind{mode: "gateup", norm: true}, map[string]int{"F": c.FF, "NW": 2 * c.FF * c.Embd / 32}); err != nil {
@@ -142,7 +145,7 @@ func (g *GPU) loadGroup(u *uploader, f *gguf.File, r io.ReaderAt, names []string
 }
 
 // fusedLayer loads one layer's weights in the fused form and makes its bind groups.
-func (g *GPU) fusedLayer(u *uploader, f *gguf.File, r io.ReaderAt, p string, x, q, att, act, scratch, state, cs *webgpu.Buffer) (*fusedBG, error) {
+func (g *GPU) fusedLayer(u *uploader, f *gguf.File, r io.ReaderAt, p string, x, q, act, pv, ml, state, cs *webgpu.Buffer) (*fusedBG, error) {
 	c := g.Cfg
 	kvd := c.KVHeads * c.HeadDim
 	var fb fusedBG
@@ -170,10 +173,10 @@ func (g *GPU) fusedLayer(u *uploader, f *gguf.File, r io.ReaderAt, p string, x, 
 	if fb.k1, err = g.bind("k1", qkvQS, qkvAux, x, q, kv, state, cs); err != nil {
 		return nil, err
 	}
-	if fb.k2, err = g.bind("k2", q, kv, scratch, att, state); err != nil {
+	if fb.k2, err = g.bind("k2", q, kv, pv, ml, state); err != nil {
 		return nil, err
 	}
-	if fb.k3, err = g.bind("k3", o.qs, o.d, att, x); err != nil {
+	if fb.k3, err = g.bind("k3", o.qs, o.d, pv, ml, state, x); err != nil {
 		return nil, err
 	}
 	if fb.k4, err = g.bind("k4", guQS, guAux, x, act); err != nil {
@@ -200,7 +203,7 @@ func (g *GPU) dispatchGrid(p *webgpu.ComputePassRecorder, kn string, bg *webgpu.
 // recordFused records the five dispatches of a fused layer.
 func (g *GPU) recordFused(p *webgpu.ComputePassRecorder, l *fusedBG) {
 	g.dispatchGrid(p, "k1", l.k1)
-	g.dispatch(p, "k2", l.k2, uint32(g.Cfg.Heads), 1)
+	g.dispatch(p, "k2", l.k2, uint32((g.pos+g.wg)/g.wg), uint32(g.Cfg.Heads))
 	g.dispatchGrid(p, "k3", l.k3)
 	g.dispatchGrid(p, "k4", l.k4)
 	g.dispatchGrid(p, l.k5n, l.k5)
