@@ -52,7 +52,11 @@ func main() {
 	model := fs.String("model", defaultModel, "GGUF file")
 	rounds := fs.Int("rounds", 5, "bench rounds")
 	p := fs.Int("p", 128, "bench prompt length")
+	skip := fs.String("skip", "", "profiling: comma-separated kernel classes left out of the pass (rms,q40,q41,q80,rope,attn,swi,embed,argmax,adv or all)")
+	nofused := fs.Bool("nofused", false, "use the unfused v0.2.0 kernels (A/B)")
+	tpr := fs.Int("tpr", llm.TPR, "invocations per output row in the fused matrix-vector kernels")
 	fs.Parse(args)
+	llm.NoFused, llm.TPR = *nofused, *tpr
 	prompt := strings.Join(fs.Args(), " ")
 
 	fh, err := os.Open(*model)
@@ -92,6 +96,12 @@ func main() {
 	}
 	fmt.Printf("load: %.0f ms, GPU memory %d bytes, %d submits\n", ms(time.Since(t0)), g.MemoryUsed(), g.Stats.Submits)
 
+	if *skip != "" {
+		g.Skip = map[string]bool{}
+		for _, k := range strings.Split(*skip, ",") {
+			g.Skip[k] = true
+		}
+	}
 	switch mode {
 	case "run":
 		ids := tok.Encode(prompt)

@@ -428,9 +428,13 @@ func itoa(n int) string {
 // Shaders returns every kernel's WGSL for workgroup size wg, by name: for
 // tools that validate them (cmd/wgsldump).
 func Shaders(wg int) map[string]string {
-	return map[string]string{
+	m := fusedShaders(wg)
+	for k, v := range map[string]string{
 		"embed": wgsl(kernelEmbed, wg), "rms": wgsl(kernelRMS, wg), "q40": wgsl(kernelMatvecQ40, wg), "q41": wgsl(kernelMatvecQ41, wg),
 		"q80": wgsl(kernelMatvecQ80, wg), "rope": wgsl(kernelRopeKV, wg), "attn": wgsl(kernelAttn, wg), "swi": wgsl(kernelSwiGLU, wg),
 		"argmax": wgsl(kernelArgmax, wg), "adv": wgsl(kernelAdvance, wg),
+	} {
+		m[k] = v
 	}
+	return m
 }

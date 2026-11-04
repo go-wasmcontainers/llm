@@ -72,6 +72,7 @@ type mat struct {
 
 type layerBG struct {
 	rms1, q, k, v, rope, attn, o, rms2, gate, up, swi, down *webgpu.BindGroup
+	fx                                                      *fusedBG // the fused form (fused.go), when set the fields above are not
 }
 
 // GPU is the forward pass on the GPU for the llama architecture, in f32.
@@ -104,7 +105,12 @@ type GPU struct {
 	// Layers, when non-zero, runs only that many layers (debugging; no
 	// logits and no sampling are then produced).
 	Layers int
+	Skip   map[string]bool
+	fgrid  map[string]fusedGrid
 }
+
+// NoFused turns the fused layer kernels off (the v0.2.0 path, for A/B runs).
+var NoFused bool
 
 func (g *GPU) buffer(size uint64, usage webgpu.BufferUsage) (*webgpu.Buffer, error) {
 	size = (size + 3) &^ 3
@@ -261,6 +267,21 @@ func (g *GPU) loadMat(u *uploader, f *gguf.File, r io.ReaderAt, name string) (*m
 			return nil, err
 		}
 	}
+	return m, g.streamMat(u, f, r, *t, m.qs, m.d, m.m, 0)
+}
+
+// streamMat writes the blocks of tensor t into the buffers qs, d (and mm for
+// Q4_1) from block blkOff on: a matrix alone (0) or one of a concatenated
+// group.
+func (g *GPU) streamMat(u *uploader, f *gguf.File, r io.ReaderAt, t gguf.Tensor, qsBuf, dBuf, mBuf *webgpu.Buffer, blkOff uint64) error {
+	name := t.Name
+	_, bb, _ := t.Type.BlockSize()
+	qb := uint64(16)
+	if t.Type == gguf.TypeQ8_0 {
+		qb = 32
+	}
+	hasM := t.Type == gguf.TypeQ4_1
+	nblk := t.Size / bb
 	// Pieces of PieceSize raw bytes, in scratch buffers allocated once: the
 	// guest's own memory stays a few times PieceSize however big the model.
 	per := uint64(PieceSize) / bb
@@ -271,7 +292,7 @@ func (g *GPU) loadMat(u *uploader, f *gguf.File, r io.ReaderAt, name string) (*m
 	for b0 := uint64(0); b0 < nblk; b0 += per {
 		n := min(per, nblk-b0)
 		if _, err := r.ReadAt(raw[:n*bb], int64(f.DataOffset+t.Offset+b0*bb)); err != nil {
-			return nil, fmt.Errorf("llm: reading %s: %w", name, err)
+			return fmt.Errorf("llm: reading %s: %w", name, err)
 		}
 		for i := uint64(0); i < n; i++ {
 			blk := raw[i*bb : (i+1)*bb]
@@ -283,19 +304,19 @@ func (g *GPU) loadMat(u *uploader, f *gguf.File, r io.ReaderAt, name string) (*m
 			}
 			copy(qsb[i*qb:], blk[off:off+qb])
 		}
-		if err := u.write(m.qs, b0*qb, qsb[:n*qb]); err != nil {
-			return nil, err
+		if err := u.write(qsBuf, (blkOff+b0)*qb, qsb[:n*qb]); err != nil {
+			return err
 		}
-		if err := u.write(m.d, b0*4, db[:n*4]); err != nil {
-			return nil, err
+		if err := u.write(dBuf, (blkOff+b0)*4, db[:n*4]); err != nil {
+			return err
 		}
 		if hasM {
-			if err := u.write(m.m, b0*4, mb[:n*4]); err != nil {
-				return nil, err
+			if err := u.write(mBuf, (blkOff+b0)*4, mb[:n*4]); err != nil {
+				return err
 			}
 		}
 	}
-	return m, nil
+	return nil
 }
 
 func (g *GPU) loadF32(u *uploader, f *gguf.File, r io.ReaderAt, name string) (*webgpu.Buffer, error) {
@@ -363,7 +384,7 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	if ctx <= 0 || ctx > cfg.Ctx {
 		ctx = cfg.Ctx
 	}
-	g := &GPU{dev: dev, lim: lim, Cfg: cfg, ctx: ctx, wg: lim.WorkgroupSize(), named: map[string]*webgpu.Buffer{}, k: map[string]*kernel{}, kinds: map[*webgpu.BindGroup]string{}}
+	g := &GPU{dev: dev, lim: lim, Cfg: cfg, ctx: ctx, wg: lim.WorkgroupSize(), named: map[string]*webgpu.Buffer{}, fgrid: map[string]fusedGrid{}, k: map[string]*kernel{}, kinds: map[*webgpu.BindGroup]string{}}
 	if lim.MaxWorkgroupsPerDimension == 0 || lim.MaxStorageBuffers < 8 {
 		return nil, errors.New("llm: adapter limits below WebGPU's defaults")
 	}
@@ -470,6 +491,17 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 	for l := 0; l < c.Layers; l++ {
 		p := fmt.Sprintf("blk.%d.", l)
 		var lb layerBG
+		if !NoFused && g.fusedOK() && layerFusable(f, p) {
+			dt, _ := f.Tensor(p + "ffn_down.weight")
+			if err := g.fusedKernels(dt.Type == gguf.TypeQ4_1); err != nil {
+				return nil, err
+			}
+			if lb.fx, err = g.fusedLayer(u, f, r, p, x, q, att, gt, scratch, state, csb); err != nil {
+				return nil, err
+			}
+			g.layers = append(g.layers, lb)
+			continue
+		}
 		an, err := g.loadF32(u, f, r, p+"attn_norm.weight")
 		if err != nil {
 			return nil, err
@@ -531,7 +563,13 @@ func NewGPU(dev *webgpu.Device, lim Limits, f *gguf.File, r io.ReaderAt, ctx int
 // MemoryUsed is the GPU memory the model, its cache and its scratch hold.
 func (g *GPU) MemoryUsed() uint64 { return g.used }
 
+// Skip names the kernel classes the pass leaves out ("all" for every one): a
+// profiling aid. GPU time per class is the decode time with the class minus
+// the decode time without it; the output is garbage then.
 func (g *GPU) dispatch(p *webgpu.ComputePassRecorder, kn string, bg *webgpu.BindGroup, x, y uint32) {
+	if g.Skip != nil && (g.Skip[kn] || g.Skip["all"]) {
+		return
+	}
 	p.SetPipeline(g.k[kn].pipe)
 	p.SetBindGroup(0, bg)
 	p.DispatchWorkgroups(x, y, 1)
@@ -557,6 +595,10 @@ func (g *GPU) token(p *webgpu.ComputePassRecorder, head bool) {
 		head = false
 	}
 	for _, l := range layers {
+		if l.fx != nil {
+			g.recordFused(p, l.fx)
+			continue
+		}
 		g.dispatch(p, "rms", l.rms1, 1, 1)
 		x, y := mvx(c.Embd)
 		g.dispatch(p, g.mvk(l.q), l.q, x, y)
