@@ -20,9 +20,10 @@ First model: SmolLM2-135M-Instruct Q4_0 (Q4_0, Q4_1 and Q8_0 tensors).
 - **Streaming load.** Weights go from the file to the GPU in 16 MiB pieces,
   repacked per block (18-byte Q4_0 blocks become aligned `u32` quants and
   `f32` scales); the model never sits in guest memory.
-- **One submit per token.** Every dispatch of the forward pass is recorded
-  into one compute pass; sampling (`argmax`) runs on the GPU and only the
-  4-byte token is read back. Prompt tokens go in submits of 8.
+- **Eight tokens per submit.** Every dispatch of the forward pass is recorded
+  into compute passes; sampling (`argmax`) runs on the GPU and only the
+  sampled tokens are read back, once per 8. Prompt tokens go through the
+  layers in chunks of up to 64.
 - **Vendor-neutral f32.** No subgroups, no `shader-f16`. The workgroup size
   (64, lower if the adapter's invocation or workgroup-memory limit is lower),
   the 2-D grids and the buffer sizes come from the adapter limits the host
@@ -72,31 +73,30 @@ Model files are never committed; tests that need them skip without
   and step-1 differences within 0.5 nats; on two of four prompts the f32
   path diverges from it at the 10th and 22nd token.
 
-## Results (2026-11-03, Apple M4 Max, Chromium, Metal, f32 kernels)
+## Results (2026-11-04, v0.3.0, Apple M4 Max, Chromium, Metal, f32 kernels)
 
 SmolLM2-135M-Instruct Q4_0, one container, greedy, 128-token prompt and 128
-generated tokens, five interleaved rounds against llama.cpp 0.8.0 on one CPU
-core (`llama-bench -t 1 -ngl 0`, the go-pkgx bottle, openssl 3.5.8), 1-minute
-load 6.4 to 7.7:
+generated tokens, interleaved rounds, 1-minute load 3.5 to 5.5. Profile, every
+change with its tok/s, loop budgets and the structural limit:
+[docs/perf/2026-11-04.md](docs/perf/2026-11-04.md).
 
 | | prefill tok/s (p50, min-max) | decode tok/s (p50, min-max) |
 |---|---|---|
-| container, WebGPU, f32 | 311 (302-318) | 171 (160-176) |
-| llama.cpp CPU, one core | 1286 (1278-1289) | 529 (521-531) |
-| WebLLM q4f32_1 (baseline, go-wasmcontainers/gpu docs/llm-baseline) | 2656 | 224 |
+| container v0.3.0, WebGPU, f32 | 5359 (5152-5472) | 580 (572-601) |
+| container v0.2.0 (same rounds) | 312 (306-321) | 154 (149-161) |
+| llama.cpp 0.8.0, one CPU core (`llama-bench -t 1 -ngl 0`, go-pkgx bottle) | 1268 (1040-1281) | 514 (499-525) |
+| WebLLM q4f32_1 (go-wasmcontainers/gpu docs/llm-baseline, not re-run) | 2656 | 224 |
 
-**Slower than the one-core CPU reference: an open defect, not yet optimised
-(faithful port first).** Where the decode time goes (per token, 405 dispatches):
-0.13-0.2 ms recording in the guest, 3.8 ms (short context) to 5.5-6 ms (context
-of 128 to 192) in `submit`, of which about 0.4 ms is the crossing (measured
-separately, docs/llm-design.md). So the GPU work itself, about 9 us per
-dispatch of tiny kernels (a 576-wide row is 72 words for 64 threads), and an
-attention kernel with one workgroup per head that walks the context serially,
-are the cause. Prefill is a decode pass per prompt token (8 per submit):
-no matrix-matrix kernel yet.
+v0.2.0 was slower than the one-core CPU reference (171 against 529 decode):
+405 tiny dependent dispatches and a serial attention kernel. v0.3.0 fuses a
+layer into five dispatches (RMSNorm, QKV, RoPE and KV append; attention in
+chunks merged in the output projection; RMSNorm, gate, up and SiLU; down),
+computes 8 tokens per decode submit and runs prompt chunks of up to 64 tokens
+through the layers together. Models whose layers are not Q4_0 (down may be
+Q4_1) keep the v0.2.0 kernels. Firefox and non-Apple adapters are not
+measured.
 
-Correctness: on four fixed prompts the container's 32 greedy tokens equal
-llama.cpp's on two; the other two diverge at the 10th and 22nd token at a
-near-tie of llama.cpp's own distribution (0.16 and 0.12 nats), exactly as the Go
-CPU path (f32) does. GPU against CPU path: logits within 1.6e-6 relative,
-16 of 16 tokens equal.
+Correctness: the strict oracle (llama.cpp on the same weights dequantised to
+F32) gives 32 of 32 greedy tokens on all four prompts. GPU against CPU path:
+logits within 1.5e-6 relative, 16 of 16 tokens equal, on a 4-token and a
+187-token prompt.
