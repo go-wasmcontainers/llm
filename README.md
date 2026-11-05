@@ -98,6 +98,9 @@ Qwen2.5-0.5B-Instruct Q4_0 (v0.4.0, same method, load 6):
 | llama.cpp 0.8.0, one CPU core | 426 (424-432) | 161 (160-162) |
 | WebLLM q4f32_1 (not re-run) | 2184 | 177 |
 
+v0.5.0 runs the Q8_0 output matrix through kernels/q4: decode 1.19 times
+v0.4.0's (325 to 387 tok/s, interleaved, load at most 6.6).
+
 Strict oracle: 32 of 32 greedy tokens on 4 of 4 prompts; GPU against CPU path
 4.3e-6 relative on a 137-token prompt
 ([docs/perf/2026-11-04-qwen2.5-0.5b.md](docs/perf/2026-11-04-qwen2.5-0.5b.md)).
