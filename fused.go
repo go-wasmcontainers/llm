@@ -273,6 +273,10 @@ func (g *GPU) recordHead(p *webgpu.ComputePassRecorder, fromLast bool) {
 		g.dispatch(p, "rms", g.rmsF, 1, 1)
 	}
 	for _, hd := range g.heads {
+		if hd.fused {
+			g.dispatchGrid(p, hd.kn, hd.bg, 1)
+			continue
+		}
 		x, y := g.grid(hd.rows)
 		g.dispatch(p, hd.kn, hd.bg, x, y)
 	}
