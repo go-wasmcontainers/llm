@@ -4,5 +4,5 @@ github.com/go-gfx/wgsl v0.4.0 h1:SJOaSkvTcPvK9wdp3vM8ruXFvtxeFLvYEBLV3ZPm4zA=
 github.com/go-gfx/wgsl v0.4.0/go.mod h1:Fzzw0jXvB+zxCqmTDwvcu3B7PkIVJBcygl2dyDyDAgQ=
 github.com/go-virtio/gpu v0.10.0 h1:OQNYudPxHr8KB4e/eVRuCDGfC4+c5F/ljpUDD3A+Bg4=
 github.com/go-virtio/gpu v0.10.0/go.mod h1:xT7FjSKJXAS9+PMsP8q0lBYF/H4FTkOkKzOoM6BV3as=
-github.com/go-wasmcontainers/gpu v0.15.0 h1:+uuAuZiu69vz3jbCpQ3cNSp7866CsaID77sRu6dQ8p0=
-github.com/go-wasmcontainers/gpu v0.15.0/go.mod h1:Jzc6WAd1d2/luQ78fNuZCMBSwi85h1Y3c9SGeg/1m5c=
+github.com/go-wasmcontainers/gpu v0.16.0 h1://OeoKvyfgaFB7VvXvrd6VasRi9opTcGLty8uxE0KJ8=
+github.com/go-wasmcontainers/gpu v0.16.0/go.mod h1:Jzc6WAd1d2/luQ78fNuZCMBSwi85h1Y3c9SGeg/1m5c=
